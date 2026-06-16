@@ -1,3 +1,12 @@
+1. g1_config_ground_prone.py
+2. host_ground_prone.py
+3. g1_host_env_cfg.py
+4. g1_host_observations.py
+5. g1_host_rewards.py
+6. g1_host_events.py
+7. g1_host_agent_cfg.py
+
+
 Good. Now we can talk about an actual porting plan instead of a conceptual one.
 
 The first thing to understand is:
