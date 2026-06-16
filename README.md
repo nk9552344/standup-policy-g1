@@ -1,140 +1,454 @@
-![Project banner](https://raw.githubusercontent.com/mujocolab/mjlab/main/docs/source/_static/mjlab-banner.jpg)
+Good. Now we can talk about an actual porting plan instead of a conceptual one.
 
-# mjlab
+The first thing to understand is:
 
-[![GitHub Actions](https://img.shields.io/github/actions/workflow/status/mujocolab/mjlab/ci.yml?branch=main)](https://github.com/mujocolab/mjlab/actions/workflows/ci.yml?query=branch%3Amain)
-[![Documentation](https://github.com/mujocolab/mjlab/actions/workflows/docs.yml/badge.svg)](https://mujocolab.github.io/mjlab/)
-[![License](https://img.shields.io/github/license/mujocolab/mjlab)](https://github.com/mujocolab/mjlab/blob/main/LICENSE)
-[![Nightly Benchmarks](https://img.shields.io/badge/Nightly-Benchmarks-blue)](https://mujocolab.github.io/mjlab/nightly/)
-[![PyPI](https://img.shields.io/pypi/v/mjlab)](https://pypi.org/project/mjlab/)
-[![PyPI downloads](https://img.shields.io/pypi/dm/mjlab?color=blue)](https://pypistats.org/packages/mjlab)
+```text
+HoST
+├── rsl_rl
+└── legged_gym
+```
 
-mjlab combines [Isaac Lab](https://github.com/isaac-sim/IsaacLab)'s manager-based API with [MuJoCo Warp](https://github.com/google-deepmind/mujoco_warp), a GPU-accelerated version of [MuJoCo](https://github.com/google-deepmind/mujoco).
-The framework provides composable building blocks for environment design,
-with minimal dependencies and direct access to native MuJoCo data structures.
+In MJLab, **you will throw away almost the entire `rsl_rl` folder**.
 
-## Getting Started
+MJLab already has:
 
-mjlab requires an NVIDIA GPU for training. macOS is supported for evaluation only.
+```text
+src/mjlab/agents/rsl_rl/
+```
 
-**Try it now:**
+which replaces:
 
-Run the demo (no installation needed):
+```text
+HoST/rsl_rl/
+```
+
+So:
+
+```text
+HoST/rsl_rl/*
+                X DO NOT PORT
+```
+
+You only port environment logic.
+
+---
+
+# STEP 1: Ignore rsl_rl completely
+
+Do not touch:
+
+```text
+rsl_rl/algorithms/
+rsl_rl/modules/
+rsl_rl/runners/
+rsl_rl/storage/
+rsl_rl/env/
+```
+
+Equivalent already exists in MJLab.
+
+| HoST                | MJLab                 |
+| ------------------- | --------------------- |
+| actor_critic.py     | MJLab RSL-RL          |
+| ppo.py              | MJLab PPO             |
+| rollout_storage.py  | MJLab rollout storage |
+| on_policy_runner.py | MJLab runner          |
+
+Port effort:
+
+```text
+0 files
+```
+
+---
+
+# STEP 2: Port robot asset
+
+HoST:
+
+```text
+resources/robots/g1/
+    g1_23dof.urdf
+    meshes/
+```
+
+Check whether MJLab already has G1.
+
+If MJLab already contains:
+
+```text
+src/mjlab/assets/unitree/g1/
+```
+
+then:
+
+```text
+PORT NOTHING
+```
+
+Use MJLab's robot.
+
+This is what I recommend.
+
+---
+
+# STEP 3: Find the actual environment
+
+The core files are:
+
+```text
+host_ground.py
+host_ground_prone.py
+host_platform.py
+host_slope.py
+host_wall.py
+```
+
+These are the files that matter.
+
+Everything else configures them.
+
+---
+
+# STEP 4: Create MJLab task folder
+
+Create:
+
+```text
+src/mjlab/tasks/standing/g1_host/
+```
+
+Inside:
+
+```text
+src/mjlab/tasks/standing/g1_host/
+├── __init__.py
+├── g1_host_env_cfg.py
+├── g1_host_rewards.py
+├── g1_host_events.py
+├── g1_host_observations.py
+└── g1_host_agent_cfg.py
+```
+
+---
+
+# STEP 5: Port g1_config_ground.py
+
+HoST:
+
+```text
+envs/g1/g1_config_ground.py
+```
+
+contains:
+
+```python
+class G1Cfg(...)
+class G1CfgPPO(...)
+```
+
+These become:
+
+```text
+g1_host_env_cfg.py
+g1_host_agent_cfg.py
+```
+
+Mapping:
+
+| HoST     | MJLab     |
+| -------- | --------- |
+| G1Cfg    | EnvCfg    |
+| G1CfgPPO | RunnerCfg |
+
+---
+
+# STEP 6: Port observations
+
+Look inside:
+
+```text
+host_ground.py
+```
+
+Find:
+
+```python
+def compute_observations()
+```
+
+Everything in there becomes:
+
+```text
+g1_host_observations.py
+```
+
+Example:
+
+HoST:
+
+```python
+obs = torch.cat([
+    base_ang_vel,
+    projected_gravity,
+    dof_pos,
+    dof_vel,
+    actions
+], dim=-1)
+```
+
+MJLab:
+
+```python
+ObsTerm(
+    func=mdp.base_ang_vel
+)
+
+ObsTerm(
+    func=mdp.projected_gravity
+)
+
+ObsTerm(
+    func=mdp.joint_pos_rel
+)
+
+ObsTerm(
+    func=mdp.joint_vel_rel
+)
+
+ObsTerm(
+    func=mdp.last_action
+)
+```
+
+This is usually 1-2 hours.
+
+---
+
+# STEP 7: Port rewards
+
+This is the most important file.
+
+Search:
+
+```python
+def compute_reward()
+```
+
+inside:
+
+```text
+host_ground.py
+host_ground_prone.py
+```
+
+You'll find terms like:
+
+```python
+reward_upright
+reward_height
+reward_joint_regularization
+reward_torque
+reward_action_rate
+```
+
+Create:
+
+```text
+g1_host_rewards.py
+```
+
+Each reward becomes:
+
+```python
+def upright_reward(...)
+```
+
+then register:
+
+```python
+RewardTermCfg(
+    func=upright_reward,
+    weight=...
+)
+```
+
+inside:
+
+```python
+self.rewards
+```
+
+of
+
+```text
+g1_host_env_cfg.py
+```
+
+---
+
+# STEP 8: Port reset logic
+
+Most important file:
+
+```text
+host_ground_prone.py
+```
+
+Look for:
+
+```python
+def reset_idx()
+```
+
+This is where HoST generates:
+
+```text
+supine
+prone
+side
+kneeling
+```
+
+states.
+
+Port these into:
+
+```text
+g1_host_events.py
+```
+
+Example:
+
+HoST:
+
+```python
+root_state[:, 3:7] = quat
+dof_pos[:] = pose
+```
+
+MJLab:
+
+```python
+EventTermCfg(
+    func=random_prone_reset
+)
+```
+
+This is where most of the standing-up behavior comes from.
+
+---
+
+# STEP 9: Port curriculum
+
+Search:
+
+```python
+curriculum
+```
+
+or
+
+```python
+update_curriculum()
+```
+
+inside:
+
+```text
+host_ground_prone.py
+```
+
+Create:
+
+```text
+g1_host_curriculum.py
+```
+
+or embed inside env cfg.
+
+Map:
+
+```text
+easy pose
+↓
+hard pose
+↓
+full prone pose
+```
+
+curriculum.
+
+---
+
+# STEP 10: Ignore scripts
+
+Do NOT port:
+
+```text
+scripts/train.py
+scripts/play.py
+scripts/eval/*
+```
+
+MJLab already has:
 
 ```bash
-uvx --from mjlab --refresh demo
+uv run train ...
+uv run play ...
 ```
 
-Or try in [Google Colab](https://colab.research.google.com/github/mujocolab/mjlab/blob/main/notebooks/demo.ipynb) (no local setup required).
+---
 
-**Install from source:**
+# Actual minimal port
 
-```bash
-git clone https://github.com/mujocolab/mjlab.git && cd mjlab
-uv run demo
+If your goal is:
+
+```text
+fallen state
+      ↓
+neutral stand
 ```
 
-For alternative installation methods (PyPI, Docker), see the [Installation Guide](https://mujocolab.github.io/mjlab/main/source/installation.html).
+you only need:
 
-## Training Examples
-
-### 1. Velocity Tracking
-
-Train a Unitree G1 humanoid to follow velocity commands on flat terrain:
-
-```bash
-uv run train Mjlab-Velocity-Flat-Unitree-G1 --env.scene.num-envs 4096
+```text
+host_ground_prone.py
+g1_config_ground_prone.py
+g1_utils.py
 ```
 
-**Multi-GPU Training:** Scale to multiple GPUs using `--gpu-ids`:
+Everything else can be ignored initially.
 
-```bash
-uv run train Mjlab-Velocity-Flat-Unitree-G1 \
-  --gpu-ids "[0, 1]" \
-  --env.scene.num-envs 4096
+So the real mapping is:
+
+```text
+HoST
+│
+├── host_ground_prone.py
+│        ↓
+│   g1_host_rewards.py
+│   g1_host_events.py
+│   g1_host_observations.py
+│
+├── g1_config_ground_prone.py
+│        ↓
+│   g1_host_env_cfg.py
+│   g1_host_agent_cfg.py
+│
+└── g1_utils.py
+         ↓
+    utility functions
 ```
 
-See the [Distributed Training guide](https://mujocolab.github.io/mjlab/main/source/training/distributed_training.html) for details.
+That is probably **90% of the useful code** for reproducing HoST in MJLab.
 
-Evaluate a policy while training (fetches latest checkpoint from Weights & Biases):
+My recommendation would be to start by opening only these three files:
 
-```bash
-uv run play Mjlab-Velocity-Flat-Unitree-G1 --wandb-run-path your-org/mjlab/run-id
+```text
+host_ground_prone.py
+g1_config_ground_prone.py
+g1_utils.py
 ```
 
-### 2. Motion Imitation
-
-Train a humanoid to mimic reference motions. See the [motion imitation guide](https://mujocolab.github.io/mjlab/main/source/training/motion_imitation.html) for preprocessing setup.
-
-```bash
-uv run train Mjlab-Tracking-Flat-Unitree-G1 --registry-name your-org/motions/motion-name --env.scene.num-envs 4096
-uv run play Mjlab-Tracking-Flat-Unitree-G1 --wandb-run-path your-org/mjlab/run-id
-```
-
-### 3. Sanity-check with Dummy Agents
-
-Use built-in agents to sanity check your MDP before training:
-
-```bash
-uv run play Mjlab-Your-Task-Id --agent zero  # Sends zero actions
-uv run play Mjlab-Your-Task-Id --agent random  # Sends uniform random actions
-```
-
-When running motion-tracking tasks, add `--registry-name your-org/motions/motion-name` to the command.
-
-
-## Documentation
-
-Full documentation is available at **[mujocolab.github.io/mjlab](https://mujocolab.github.io/mjlab/)**.
-
-## Development
-
-```bash
-make test          # Run all tests
-make test-fast     # Skip slow tests
-make format        # Format and lint
-make docs          # Build docs locally
-```
-
-For development setup: `uvx pre-commit install`
-
-## Citation
-
-mjlab is used in published research and open-source robotics projects. See the [Research](https://mujocolab.github.io/mjlab/main/source/research.html) page for publications and projects, or share your own in [Show and Tell](https://github.com/mujocolab/mjlab/discussions/categories/show-and-tell).
-
-If you use mjlab in your research, please consider citing:
-
-```bibtex
-@misc{zakka2026mjlablightweightframeworkgpuaccelerated,
-  title={mjlab: A Lightweight Framework for GPU-Accelerated Robot Learning},
-  author={Kevin Zakka and Qiayuan Liao and Brent Yi and Louis Le Lay and Koushil Sreenath and Pieter Abbeel},
-  year={2026},
-  eprint={2601.22074},
-  archivePrefix={arXiv},
-  primaryClass={cs.RO},
-  url={https://arxiv.org/abs/2601.22074},
-}
-```
-
-## License
-
-mjlab is licensed under the [Apache License, Version 2.0](LICENSE).
-
-### Third-Party Code
-
-Some portions of mjlab are forked from external projects:
-
-- **`src/mjlab/utils/lab_api/`** — Utilities forked from [NVIDIA Isaac
-  Lab](https://github.com/isaac-sim/IsaacLab) (BSD-3-Clause license, see file
-  headers)
-
-Forked components retain their original licenses. See file headers for details.
-
-## Acknowledgments
-
-mjlab wouldn't exist without the excellent work of the Isaac Lab team, whose API
-design and abstractions mjlab builds upon.
-
-Thanks to the MuJoCo Warp team — especially Erik Frey and Taylor Howell — for
-answering our questions, giving helpful feedback, and implementing features
-based on our requests countless times.
+and ignore the other 95% of the repository. Those three files define almost all of the standing-up task logic you actually care about.
