@@ -1,7 +1,50 @@
-"""Velocity task configuration.
+"""Standup task configuration.
 
-This module provides a factory function to create a base velocity task config.
+This module provides a factory function to create a base standup task config.
 Robot-specific configurations call the factory and customize as needed.
+
+Forked from the velocity locomotion env cfg. Summary of what changed and why
+(full reasoning lives in the comments of each mdp module this file wires
+together -- standup_command.py, standup_reward.py, standup_observations.py,
+standup_events.py, standup_termination.py, standup_curriculum.py):
+
+  - commands.twist: UniformVelocityCommandCfg -> StandStillCommandCfg. No
+    velocity to track; command is always zero, observed so reward/obs code
+    keeps a stable shape.
+  - rewards: track_linear_velocity/track_angular_velocity -> hold_still
+    (gated to only fire once standing). variable_posture's command-speed
+    bands -> standing/recovering bands gated the same way. All gait-cycle
+    terms (air_time, foot_clearance, foot_swing_height, foot_slip,
+    soft_landing) dropped -- no walking gait cycle in a standup motion.
+    New: standup_progress, a dense shaping reward toward standing height +
+    uprightness, since nothing else here rewards the act of getting up
+    itself.
+  - observations: critic foot_air_time/foot_contact_forces dropped (gait-
+    cycle / impact-force signals not needed); foot_height_scan sensor and
+    foot_contact kept (still useful: which feet/hands are touching the
+    ground while getting up). New: base_height, since how far through
+    standing up the robot is wasn't directly observable before.
+  - events: reset_base now uses reset_fallen_state instead of a small pose
+    jitter near standing, since standup needs to start from arbitrary
+    fallen/tumbled states, not just small perturbations of a standing pose.
+    push_robot kept unchanged -- it already does exactly the "pushed while
+    standing up" mechanism needed.
+  - terminations: fell_over (bad_orientation) replaced with
+    catastrophic_state -- bad_orientation would terminate every standup
+    episode at t=0, since starting "badly oriented" (lying down) is the
+    entire premise of the task. New: stuck_no_progress, to cut off episodes
+    where the robot has stalled rather than burning the full episode length.
+  - curriculum: terrain_levels_vel -> terrain_levels_standup (success-rate
+    driven instead of distance-walked). commands_vel -> fall_difficulty
+    (eases fall/disturbance severity over training instead of widening
+    velocity ranges, since there's no velocity command to widen).
+
+NOTE on min_standing_height: this threshold is used across hold_still,
+variable_posture, terrain_levels_standup, and catastrophic_state to decide
+"has the robot finished standing up". It depends on your specific robot's
+standing height and is left as an explicit placeholder (~0.6-0.7x a typical
+standing height) -- tune per-robot the same way other "Set per-robot"
+placeholders in this file are tuned.
 """
 
 import math
@@ -29,16 +72,20 @@ from mjlab.sensor import (
 )
 from mjlab.sim import MujocoCfg, SimulationCfg
 from mjlab.tasks.standup import mdp
-from mjlab.tasks.standup.mdp import UniformVelocityCommandCfg # remove use standstill command
 from mjlab.tasks.standup.mdp.standup_command import StandStillCommandCfg
 from mjlab.terrains import TerrainEntityCfg
 from mjlab.terrains.config import ROUGH_TERRAINS_CFG
 from mjlab.utils.noise import UniformNoiseCfg as Unoise
 from mjlab.viewer import ViewerConfig
 
+# Placeholder: ~0.6-0.7x a typical standing height. Tune per-robot, same as
+# other "Set per-robot" values in this file -- this is the single threshold
+# used everywhere "has the robot finished standing up" needs to be decided.
+MIN_STANDING_HEIGHT = 0.5
+
 
 def make_standup_env_cfg() -> ManagerBasedRlEnvCfg:
-  """Create base Standup tracking task configuration."""
+  """Create base Standup task configuration."""
 
   ##
   # Sensors
@@ -89,6 +136,10 @@ def make_standup_env_cfg() -> ManagerBasedRlEnvCfg:
       func=mdp.projected_gravity,
       noise=Unoise(n_min=-0.05, n_max=0.05),
     ),
+    "base_height": ObservationTermCfg(
+      func=mdp.base_height,
+      noise=Unoise(n_min=-0.02, n_max=0.02),
+    ),
     "joint_pos": ObservationTermCfg(
       func=mdp.joint_pos_rel,
       noise=Unoise(n_min=-0.01, n_max=0.01),
@@ -100,7 +151,7 @@ def make_standup_env_cfg() -> ManagerBasedRlEnvCfg:
     "actions": ObservationTermCfg(func=mdp.last_action),
     "command": ObservationTermCfg(
       func=mdp.generated_commands,
-      params={"command_name": "twist"},
+      params={"command_name": "stand_still"},
     ),
     "height_scan": ObservationTermCfg(
       func=envs_mdp.height_scan,
@@ -117,22 +168,18 @@ def make_standup_env_cfg() -> ManagerBasedRlEnvCfg:
       params={"sensor_name": "terrain_scan"},
       scale=1 / terrain_scan.max_distance,
     ),
-    "foot_height": ObservationTermCfg(
-      func=mdp.foot_height,
-      params={"sensor_name": "foot_height_scan"},
-    ),
-    "foot_air_time": ObservationTermCfg(
-      func=mdp.foot_air_time,
-      params={"sensor_name": "feet_ground_contact"},
-    ),
-    "foot_contact": ObservationTermCfg(
-      func=mdp.foot_contact,
-      params={"sensor_name": "feet_ground_contact"},
-    ),
-    "foot_contact_forces": ObservationTermCfg(
-      func=mdp.foot_contact_forces,
-      params={"sensor_name": "feet_ground_contact"},
-    ),
+    # "foot_height": ObservationTermCfg(
+    #   func=mdp.foot_height,
+    #   params={"sensor_name": "foot_height_scan"},
+    # ),
+    # "foot_contact": ObservationTermCfg(
+    #   func=mdp.foot_contact,
+    #   params={"sensor_name": "feet_ground_contact"},
+    # ),
+    # # foot_air_time and foot_contact_forces dropped: gait-cycle / impact-
+    # # force signals with no standup analog. foot_height + foot_contact kept
+    # # since knowing which feet/hands are touching the ground while getting
+    # # up is still useful info.
   }
 
   observations = {
@@ -176,21 +223,15 @@ def make_standup_env_cfg() -> ManagerBasedRlEnvCfg:
   ##
 
   commands: dict[str, CommandTermCfg] = {
-    "twist": UniformVelocityCommandCfg(
+    "stand_still": StandStillCommandCfg(
       entity_name="robot",
       resampling_time_range=(3.0, 8.0),
-      rel_standing_envs=0.1,
-      rel_heading_envs=0.3,
-      rel_forward_envs=0.2,
-      heading_command=True,
-      heading_control_stiffness=0.5,
+      min_standing_height=MIN_STANDING_HEIGHT,
+      # init_velocity_prob/init_*_range left at zero here: the "robot was
+      # already moving" scenario is handled by reset_base (reset_fallen_state)
+      # below, which covers it more completely (position + orientation +
+      # velocity together, not just velocity).
       debug_vis=True,
-      ranges=UniformVelocityCommandCfg.Ranges(
-        lin_vel_x=(-1.0, 1.0),
-        lin_vel_y=(-1.0, 1.0),
-        ang_vel_z=(-0.5, 0.5),
-        heading=(-math.pi, math.pi),
-      ),
     )
   }
 
@@ -200,15 +241,15 @@ def make_standup_env_cfg() -> ManagerBasedRlEnvCfg:
 
   events = {
     "reset_base": EventTermCfg(
-      func=mdp.reset_root_state_uniform,
+      func=mdp.reset_fallen_state,
       mode="reset",
       params={
-        "pose_range": {
-          "x": (-0.5, 0.5),
-          "y": (-0.5, 0.5),
-          "z": (0.01, 0.05),
-          "yaw": (-3.14, 3.14),
-        },
+        # Curriculum-controlled via fall_difficulty below; this is the
+        # starting (easiest) stage -- mild perturbation near upright, not
+        # a full random fall. fall_difficulty widens this to "any" as
+        # training advances.
+        "orientation_mode": "near_upright",
+        "height_range": (0.0, 0.0),
         "velocity_range": {},
       },
     ),
@@ -226,6 +267,10 @@ def make_standup_env_cfg() -> ManagerBasedRlEnvCfg:
       mode="interval",
       interval_range_s=(1.0, 3.0),
       params={
+        # Unchanged from locomotion -- already exactly the "someone pushed
+        # the robot while standing up" mechanism. fall_difficulty widens
+        # these ranges over training the same way it widens reset_base's
+        # orientation_mode/velocity_range.
         "velocity_range": {
           "x": (-0.5, 0.5),
           "y": (-0.5, 0.5),
@@ -274,15 +319,23 @@ def make_standup_env_cfg() -> ManagerBasedRlEnvCfg:
   ##
 
   rewards = {
-    "track_linear_velocity": RewardTermCfg(
-      func=mdp.track_linear_velocity,
-      weight=2.0,
-      params={"command_name": "twist", "std": math.sqrt(0.25)},
+    "standup_progress": RewardTermCfg(
+      func=mdp.standup_progress,
+      weight=3.0,
+      params={
+        "target_height": MIN_STANDING_HEIGHT,
+        "height_weight": 1.0,
+        "uprightness_weight": 1.0,
+      },
     ),
-    "track_angular_velocity": RewardTermCfg(
-      func=mdp.track_angular_velocity,
+    "hold_still": RewardTermCfg(
+      func=mdp.hold_still,
       weight=2.0,
-      params={"command_name": "twist", "std": math.sqrt(0.5)},
+      params={
+        "std": math.sqrt(0.25),
+        "min_standing_height": MIN_STANDING_HEIGHT,
+        "min_standing_uprightness": 0.8,
+      },
     ),
     "upright": RewardTermCfg(
       func=mdp.upright,
@@ -297,17 +350,17 @@ def make_standup_env_cfg() -> ManagerBasedRlEnvCfg:
       weight=1.0,
       params={
         "asset_cfg": SceneEntityCfg("robot", joint_names=(".*",)),
-        "command_name": "twist",
+        "min_standing_height": MIN_STANDING_HEIGHT,
+        "min_standing_uprightness": 0.8,
+        "std_recovering": {},  # Set per-robot.
         "std_standing": {},  # Set per-robot.
-        "std_walking": {},  # Set per-robot.
-        "std_running": {},  # Set per-robot.
-        "walking_threshold": 0.05,
-        "running_threshold": 1.5,
       },
     ),
     "body_ang_vel": RewardTermCfg(
       func=mdp.body_angular_velocity_penalty,
-      weight=0.0,  # Override per-robot
+      weight=0.0,  # Override per-robot. Consider gating to standing-only
+      # if it fights the recovery/tumble motion in practice -- see note in
+      # standup_reward.py.
       params={"asset_cfg": SceneEntityCfg("robot", body_names=())},  # Set per-robot.
     ),
     "angular_momentum": RewardTermCfg(
@@ -317,58 +370,14 @@ def make_standup_env_cfg() -> ManagerBasedRlEnvCfg:
     ),
     "dof_pos_limits": RewardTermCfg(func=mdp.joint_pos_limits, weight=-1.0),
     "action_rate_l2": RewardTermCfg(func=mdp.action_rate_l2, weight=-0.1),
-    "air_time": RewardTermCfg(
-      func=mdp.feet_air_time,
-      weight=0.0,  # Override per-robot.
-      params={
-        "sensor_name": "feet_ground_contact",
-        "threshold_min": 0.05,
-        "threshold_max": 0.5,
-        "command_name": "twist",
-        "command_threshold": 0.5,
-      },
+    "self_collision": RewardTermCfg(
+      func=mdp.self_collision_cost,
+      weight=-0.1,  # Override per-robot.
+      params={"sensor_name": "robot/self_collision"},  # Set per-robot.
     ),
-    "foot_clearance": RewardTermCfg(
-      func=mdp.feet_clearance,
-      weight=-2.0,
-      params={
-        "target_height": 0.1,
-        "height_sensor_name": "foot_height_scan",
-        "command_name": "twist",
-        "command_threshold": 0.05,
-        "asset_cfg": SceneEntityCfg("robot", site_names=()),  # Set per-robot.
-      },
-    ),
-    "foot_swing_height": RewardTermCfg(
-      func=mdp.feet_swing_height,
-      weight=-0.25,
-      params={
-        "sensor_name": "feet_ground_contact",
-        "height_sensor_name": "foot_height_scan",
-        "target_height": 0.1,
-        "command_name": "twist",
-        "command_threshold": 0.05,
-      },
-    ),
-    "foot_slip": RewardTermCfg(
-      func=mdp.feet_slip,
-      weight=-0.1,
-      params={
-        "sensor_name": "feet_ground_contact",
-        "command_name": "twist",
-        "command_threshold": 0.05,
-        "asset_cfg": SceneEntityCfg("robot", site_names=()),  # Set per-robot.
-      },
-    ),
-    "soft_landing": RewardTermCfg(
-      func=mdp.soft_landing,
-      weight=-1e-5,
-      params={
-        "sensor_name": "feet_ground_contact",
-        "command_name": "twist",
-        "command_threshold": 0.05,
-      },
-    ),
+    # air_time, foot_clearance, foot_swing_height, foot_slip, soft_landing
+    # all dropped: gait-cycle terms for a walking step pattern, with no
+    # equivalent during a standup motion.
   }
 
   ##
@@ -377,14 +386,28 @@ def make_standup_env_cfg() -> ManagerBasedRlEnvCfg:
 
   terminations = {
     "time_out": TerminationTermCfg(func=mdp.time_out, time_out=True),
-    "fell_over": TerminationTermCfg(
-      func=mdp.bad_orientation,
-      params={"limit_angle": math.radians(70.0)},
+    "catastrophic_state": TerminationTermCfg(
+      func=mdp.catastrophic_state,
+      params={
+        "min_height": -0.5,  # Sanity bound, not a "fallen" check -- tune to
+        "max_height": 3.0,  # your robot's scale. See standup_termination.py.
+      },
+    ),
+    "stuck_no_progress": TerminationTermCfg(
+      func=mdp.stuck_no_progress,
+      params={
+        "patience_s": 5.0,  # Tune: how long without height improvement
+        "min_improvement": 0.01,  # before giving up on this attempt.
+      },
     ),
     "out_of_terrain_bounds": TerminationTermCfg(
       func=mdp.out_of_terrain_bounds,
       time_out=True,
     ),
+    "nan_detection": TerminationTermCfg(func=mdp.nan_detection),
+    # fell_over (bad_orientation) removed: would terminate every episode at
+    # t=0, since starting badly oriented (lying down) is the entire premise
+    # of this task. Replaced by catastrophic_state above.
   }
 
   ##
@@ -393,17 +416,45 @@ def make_standup_env_cfg() -> ManagerBasedRlEnvCfg:
 
   curriculum = {
     "terrain_levels": CurriculumTermCfg(
-      func=mdp.terrain_levels_vel,
-      params={"command_name": "twist"},
-    ),
-    "command_vel": CurriculumTermCfg(
-      func=mdp.commands_vel,
+      func=mdp.terrain_levels_standup,
       params={
-        "command_name": "twist",
-        "velocity_stages": [
-          {"step": 0, "lin_vel_x": (-1.0, 1.0), "ang_vel_z": (-0.5, 0.5)},
-          {"step": 5000 * 24, "lin_vel_x": (-1.5, 2.0), "ang_vel_z": (-0.7, 0.7)},
-          {"step": 10000 * 24, "lin_vel_x": (-2.0, 3.0)},
+        "min_standing_height": MIN_STANDING_HEIGHT,
+        "min_standing_uprightness": 0.8,
+      },
+    ),
+    "fall_difficulty": CurriculumTermCfg(
+      func=mdp.fall_difficulty,
+      params={
+        "reset_event_name": "reset_base",
+        "push_event_name": "push_robot",
+        "fall_stages": [
+          {
+            "step": 0,
+            "orientation_mode": "near_upright",
+            "velocity_range": {},
+            "push_force_range": None,
+            "push_torque_range": None,
+          },
+          {
+            "step": 5000 * 24,
+            "orientation_mode": "side",
+            "velocity_range": {"x": (-1.0, 1.0), "y": (-1.0, 1.0)},
+            "push_force_range": None,
+            "push_torque_range": None,
+          },
+          {
+            "step": 10000 * 24,
+            "orientation_mode": "any",
+            "velocity_range": {
+              "x": (-2.0, 2.0),
+              "y": (-2.0, 2.0),
+              "roll": (-1.5, 1.5),
+              "pitch": (-1.5, 1.5),
+              "yaw": (-1.5, 1.5),
+            },
+            "push_force_range": None,
+            "push_torque_range": None,
+          },
         ],
       },
     ),

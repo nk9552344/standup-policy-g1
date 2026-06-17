@@ -1,5 +1,5 @@
-# Partial, needs to change the command to standstill command and remove velocity reward. and change the standup_env_cfg first.
-
+# Partial, needs to change the command to standstill command and remove velocity reward.
+# also need to change the policy runner in rl
 """Unitree G1 velocity environment configurations."""
 
 from mjlab.asset_zoo.robots import (
@@ -26,7 +26,7 @@ from mjlab.tasks.standup.standup_env_cfg import make_standup_env_cfg
 
 
 def unitree_g1_rough_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
-  """Create Unitree G1 rough terrain velocity configuration."""
+  """Create Unitree G1 rough terrain Standup configuration."""
   cfg = make_standup_env_cfg()
 
   cfg.sim.mujoco.ccd_iterations = 500
