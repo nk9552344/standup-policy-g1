@@ -1,3 +1,3 @@
-from mjlab.tasks.velocity.rl.runner import (
-  VelocityOnPolicyRunner as VelocityOnPolicyRunner,
+from mjlab.tasks.standup.rl.runner import (
+  StandupOnPolicyRunner as StandupOnPolicyRunner,
 )
