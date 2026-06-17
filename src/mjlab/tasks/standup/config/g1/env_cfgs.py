@@ -1,6 +1,43 @@
-# Partial, needs to change the command to standstill command and remove velocity reward.
-# also need to change the policy runner in rl
-"""Unitree G1 velocity environment configurations."""
+"""Unitree G1 standup environment configurations.
+
+Forked from the velocity locomotion G1 env_cfgs.py. Most of this file is
+robot-specific physical wiring (sensor frames, geom/site/body names, action
+scale) that has nothing to do with locomotion vs. standup, so it's
+unchanged. The task-coupled parts that needed conversion:
+
+  - twist_cmd (UniformVelocityCommandCfg) -> stand_still_cmd
+    (StandStillCommandCfg). Key renamed to match standup_env_cfg.py's
+    commands dict ("twist" -> "stand_still").
+  - cfg.rewards["pose"] std_standing/std_walking/std_running (3 bands) ->
+    std_standing/std_recovering (2 bands), matching variable_posture's
+    standing/recovering gate instead of a command-speed gate. The original
+    per-robot std *values* are real tuning data, not locomotion-specific in
+    themselves, so they're preserved: std_standing maps directly, and
+    std_recovering is seeded from the old std_walking numbers (looser
+    tolerance, appropriate for the large joint excursions of getting up;
+    the old std_running numbers are dropped since there's no "running"
+    regime in standup).
+  - air_time reward weight override, foot_clearance/foot_slip site_names
+    wiring: removed -- these reward terms don't exist in standup_env_cfg.py
+    (dropped as gait-cycle-only terms upstream).
+  - self_collisions: the original added a *second*, differently-named
+    reward term ("self_collisions", plural) on top of the generic
+    "self_collision" placeholder already defined in standup_env_cfg.py's
+    rewards dict, effectively shadowing it without removing it. Converted
+    to update the existing "self_collision" entry's params/weight instead
+    of creating a duplicate key.
+  - Policy runner reference: any place that imported/used
+    VelocityOnPolicyRunner should use StandupOnPolicyRunner instead (see
+    standup_runner.py). This file itself doesn't construct the runner, so
+    there's nothing to change here directly, but flagging it since the
+    leading comment in the original called it out -- check your training
+    entry-point script for the actual import.
+
+feet_ground_contact's track_air_time=True is kept even though nothing in
+standup_reward.py reads air time anymore -- harmless to leave enabled, and
+keeps the sensor cfg available if you reintroduce an air-time-derived
+signal later.
+"""
 
 from mjlab.asset_zoo.robots import (
   G1_ACTION_SCALE,
@@ -10,7 +47,6 @@ from mjlab.envs import ManagerBasedRlEnvCfg
 from mjlab.envs import mdp as envs_mdp
 from mjlab.envs.mdp.actions import JointPositionActionCfg
 from mjlab.managers.event_manager import EventTermCfg
-from mjlab.managers.reward_manager import RewardTermCfg
 from mjlab.sensor import (
   ContactMatch,
   ContactSensorCfg,
@@ -19,8 +55,6 @@ from mjlab.sensor import (
   RingPatternCfg,
   TerrainHeightSensorCfg,
 )
-from mjlab.tasks.standup import mdp
-from mjlab.tasks.standup.mdp import UniformVelocityCommandCfg
 from mjlab.tasks.standup.mdp.standup_command import StandStillCommandCfg
 from mjlab.tasks.standup.standup_env_cfg import make_standup_env_cfg
 
@@ -92,23 +126,31 @@ def unitree_g1_rough_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
 
   cfg.viewer.body_name = "torso_link"
 
-  twist_cmd = cfg.commands["twist"]
-  assert isinstance(twist_cmd, UniformVelocityCommandCfg)
-  twist_cmd.viz.z_offset = 1.15
+  stand_still_cmd = cfg.commands["stand_still"]
+  assert isinstance(stand_still_cmd, StandStillCommandCfg)
+  stand_still_cmd.viz.z_offset = 1.15
 
   cfg.events["foot_friction"].params["asset_cfg"].geom_names = geom_names
   cfg.events["base_com"].params["asset_cfg"].body_names = ("torso_link",)
 
   # Rationale for std values:
-  # - Knees/hip_pitch get the loosest std to allow natural leg bending during stride.
-  # - Hip roll/yaw stay tighter to prevent excessive lateral sway and keep gait stable.
-  # - Ankle roll is very tight for balance; ankle pitch looser for foot clearance.
-  # - Waist roll/pitch stay tight to keep the torso upright and stable.
-  # - Shoulders/elbows get moderate freedom for natural arm swing during walking.
+  # - Knees/hip_pitch get the loosest std to allow natural leg bending during
+  #   the get-up motion.
+  # - Hip roll/yaw stay tighter to prevent excessive lateral sway once
+  #   standing and keep the recovered pose stable.
+  # - Ankle roll is very tight for balance; ankle pitch looser for ground
+  #   contact/push-off during recovery.
+  # - Waist roll/pitch stay tight to keep the torso upright and stable once
+  #   standing.
+  # - Shoulders/elbows get moderate freedom -- arms are often used to push
+  #   off the ground or counterbalance during standup.
   # - Wrists are loose (0.3) since they don't affect balance much.
-  # Running values are ~1.5-2x walking values to accommodate larger motion range.
+  # std_recovering values are seeded from the original walking std values
+  # (~the same magnitude of motion freedom needed for a get-up motion as for
+  # a walking stride); the original running std values are dropped, since
+  # standup has no equivalent "running" regime.
   cfg.rewards["pose"].params["std_standing"] = {".*": 0.05}
-  cfg.rewards["pose"].params["std_walking"] = {
+  cfg.rewards["pose"].params["std_recovering"] = {
     # Lower body.
     r".*hip_pitch.*": 0.3,
     r".*hip_roll.*": 0.15,
@@ -127,41 +169,23 @@ def unitree_g1_rough_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     r".*elbow.*": 0.15,
     r".*wrist.*": 0.3,
   }
-  cfg.rewards["pose"].params["std_running"] = {
-    # Lower body.
-    r".*hip_pitch.*": 0.5,
-    r".*hip_roll.*": 0.2,
-    r".*hip_yaw.*": 0.2,
-    r".*knee.*": 0.6,
-    r".*ankle_pitch.*": 0.35,
-    r".*ankle_roll.*": 0.15,
-    # Waist.
-    r".*waist_yaw.*": 0.3,
-    r".*waist_roll.*": 0.08,
-    r".*waist_pitch.*": 0.2,
-    # Arms.
-    r".*shoulder_pitch.*": 0.5,
-    r".*shoulder_roll.*": 0.2,
-    r".*shoulder_yaw.*": 0.15,
-    r".*elbow.*": 0.35,
-    r".*wrist.*": 0.3,
-  }
 
   cfg.rewards["upright"].params["asset_cfg"].body_names = ("torso_link",)
   cfg.rewards["body_ang_vel"].params["asset_cfg"].body_names = ("torso_link",)
 
-  for reward_name in ["foot_clearance", "foot_slip"]:
-    cfg.rewards[reward_name].params["asset_cfg"].site_names = site_names
-
   cfg.rewards["body_ang_vel"].weight = -0.05
   cfg.rewards["angular_momentum"].weight = -0.02
-  cfg.rewards["air_time"].weight = 0.0
 
-  cfg.rewards["self_collisions"] = RewardTermCfg(
-    func=mdp.self_collision_cost,
-    weight=-1.0,
-    params={"sensor_name": self_collision_cfg.name, "force_threshold": 10.0},
-  )
+  # Wire the generic self_collision placeholder (defined in
+  # standup_env_cfg.py) to this robot's actual sensor name and a stronger
+  # weight, rather than adding a second duplicate reward term.
+  cfg.rewards["self_collision"].params["sensor_name"] = self_collision_cfg.name
+  cfg.rewards["self_collision"].params["force_threshold"] = 10.0
+  cfg.rewards["self_collision"].weight = -1.0
+
+  # air_time, foot_clearance, foot_slip overrides removed: these reward
+  # terms don't exist in standup_env_cfg.py (dropped upstream as gait-cycle-
+  # only terms with no standup analog).
 
   # Apply play mode overrides.
   if play:
@@ -189,7 +213,7 @@ def unitree_g1_rough_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
 
 
 def unitree_g1_flat_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
-  """Create Unitree G1 flat terrain velocity configuration."""
+  """Create Unitree G1 flat terrain standup configuration."""
   cfg = unitree_g1_rough_env_cfg(play=play)
 
   cfg.sim.njmax = 300
@@ -214,10 +238,11 @@ def unitree_g1_flat_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   # Disable terrain curriculum (not present in play mode since rough clears all).
   cfg.curriculum.pop("terrain_levels", None)
 
-  if play:
-    twist_cmd = cfg.commands["twist"]
-    assert isinstance(twist_cmd, UniformVelocityCommandCfg)
-    twist_cmd.ranges.lin_vel_x = (-1.5, 2.0)
-    twist_cmd.ranges.ang_vel_z = (-0.7, 0.7)
+  # Note: the original here overrode twist_cmd.ranges.lin_vel_x/ang_vel_z
+  # for play mode -- StandStillCommandCfg has no velocity ranges to widen
+  # (command is always zero), so there is nothing to override for
+  # stand_still_cmd in play mode. If you want play mode to test against
+  # harder pushes/falls specifically, override cfg.events["push_robot"] or
+  # cfg.events["reset_base"] params here instead.
 
   return cfg

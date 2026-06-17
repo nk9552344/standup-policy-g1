@@ -1,3 +1,21 @@
+"""Standup task on-policy runner.
+
+Forked from the velocity locomotion runner.py. No behavioral changes were
+needed: this class only handles checkpoint saving + ONNX export + metadata
+attachment for whatever policy was trained, none of which inspects
+observations, rewards, or commands -- it's training infrastructure, not
+task logic. Only the class name changed, for consistency with the rest of
+the mjlab.tasks.standup module naming.
+
+One thing worth verifying on your end (not visible from this file alone):
+get_base_metadata(self.env.unwrapped, run_name) reads from the unwrapped
+env, and if its implementation in exporter_utils.py happens to assume a
+specific command term name/shape (e.g. bakes a "twist" velocity command's
+ranges into exported metadata for downstream deployment tooling), that
+would be a real coupling point worth checking, since this runner file alone
+can't reveal that.
+"""
+
 import wandb
 
 from mjlab.rl import RslRlVecEnvWrapper
@@ -8,7 +26,7 @@ from mjlab.rl.exporter_utils import (
 from mjlab.rl.runner import MjlabOnPolicyRunner
 
 
-class VelocityOnPolicyRunner(MjlabOnPolicyRunner):
+class StandupOnPolicyRunner(MjlabOnPolicyRunner):
   env: RslRlVecEnvWrapper
 
   def save(self, path: str, infos=None):

@@ -1,6 +1,6 @@
-# need to change the policy runner in rl
+# done
 from mjlab.tasks.registry import register_mjlab_task
-from mjlab.tasks.standup.rl import VelocityOnPolicyRunner
+from mjlab.tasks.standup.rl.runner import StandupOnPolicyRunner
 
 from .env_cfgs import (
   unitree_g1_flat_env_cfg,
@@ -13,7 +13,7 @@ register_mjlab_task(
   env_cfg=unitree_g1_rough_env_cfg(),
   play_env_cfg=unitree_g1_rough_env_cfg(play=True),
   rl_cfg=unitree_g1_ppo_runner_cfg(),
-  runner_cls=VelocityOnPolicyRunner,
+  runner_cls=StandupOnPolicyRunner,
 )
 
 register_mjlab_task(
@@ -21,5 +21,5 @@ register_mjlab_task(
   env_cfg=unitree_g1_flat_env_cfg(),
   play_env_cfg=unitree_g1_flat_env_cfg(play=True),
   rl_cfg=unitree_g1_ppo_runner_cfg(),
-  runner_cls=VelocityOnPolicyRunner,
+  runner_cls=StandupOnPolicyRunner,
 )
