@@ -1,4 +1,23 @@
-"""Useful methods for MDP events."""
+"""Useful methods for MDP events.
+
+Forked from the velocity locomotion events.py. Almost nothing here actually
+needed to change: event terms describe *what physically happens to the
+robot* (resets, pushes, disturbances), not what it's being asked to do, so
+this machinery was never locomotion-specific to begin with. The only
+addition is `reset_fallen_state`, a thin convenience wrapper around
+`reset_root_state_uniform` that makes "spawn fallen / mid-motion" configs
+self-documenting instead of relying on someone reading wide, unlabeled
+pose/velocity ranges in a task cfg and guessing the intent.
+
+Everything else below -- randomize_terrain, reset_scene_to_default,
+reset_root_state_uniform, reset_root_state_from_flat_patches,
+reset_joints_by_offset, push_by_setting_velocity,
+apply_external_force_torque, apply_body_impulse -- is unchanged and is
+exactly the mechanism you want for "robot was running and stopped" (reset-
+time velocity) and "someone pushed it while standing up" (push_by_setting_
+velocity / apply_body_impulse, mode="interval" or "step", firing mid-
+episode). Use these directly rather than hand-rolling separate logic.
+"""
 
 from __future__ import annotations
 
@@ -56,11 +75,7 @@ def resolve_env_ids(
 
 
 def randomize_terrain(env: ManagerBasedRlEnv, env_ids: torch.Tensor | None) -> None:
-  """Randomize the sub-terrain for each environment on reset.
-
-  This picks a random terrain type (column) and difficulty level (row) for each
-  environment. Useful for play/evaluation mode to test on varied terrains.
-  """
+  """Randomize the sub-terrain for each environment on reset. Unchanged."""
   env_ids = resolve_env_ids(env, env_ids)
 
   terrain = env.scene.terrain
@@ -71,7 +86,7 @@ def randomize_terrain(env: ManagerBasedRlEnv, env_ids: torch.Tensor | None) -> N
 def reset_scene_to_default(
   env: ManagerBasedRlEnv, env_ids: torch.Tensor | None
 ) -> None:
-  """Reset all entities in the scene to their default states.
+  """Reset all entities in the scene to their default states. Unchanged.
 
   For floating-base entities: Resets root state (position, orientation, velocities).
   For fixed-base mocap entities: Resets mocap pose.
@@ -85,21 +100,17 @@ def reset_scene_to_default(
     if not isinstance(entity, Entity):
       continue
 
-    # Reset root/mocap pose.
     if entity.is_fixed_base and entity.is_mocap:
-      # Fixed-base mocap entity - reset mocap pose with env_origins.
       default_root_state = entity.data.default_root_state[env_ids].clone()
       mocap_pose = torch.zeros((len(env_ids), 7), device=env.device)
       mocap_pose[:, 0:3] = default_root_state[:, 0:3] + env.scene.env_origins[env_ids]
       mocap_pose[:, 3:7] = default_root_state[:, 3:7]
       entity.write_mocap_pose_to_sim(mocap_pose, env_ids=env_ids)
     elif not entity.is_fixed_base:
-      # Floating-base entity - reset root state with env_origins.
       default_root_state = entity.data.default_root_state[env_ids].clone()
       default_root_state[:, 0:3] += env.scene.env_origins[env_ids]
       entity.write_root_state_to_sim(default_root_state, env_ids=env_ids)
 
-    # Reset joint state for articulated entities.
     if entity.is_articulated:
       default_joint_pos = entity.data.default_joint_pos[env_ids].clone()
       default_joint_vel = entity.data.default_joint_vel[env_ids].clone()
@@ -115,7 +126,13 @@ def reset_root_state_uniform(
   velocity_range: dict[str, tuple[float, float]] | None = None,
   asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> None:
-  """Reset root state for floating-base or mocap fixed-base entities.
+  """Reset root state for floating-base or mocap fixed-base entities. Unchanged.
+
+  This is the core mechanism for standup's "start in some arbitrary state"
+  requirement: pass wide roll/pitch ranges (e.g. (-3.14, 3.14)) to cover
+  fallen orientations, and a nonzero velocity_range to cover "still moving
+  when the episode starts". See `reset_fallen_state` below for a named
+  wrapper instead of inlining these ranges in your task cfg directly.
 
   For floating-base entities: Resets pose and velocity via write_root_state_to_sim().
   For fixed-base mocap entities: Resets pose only via write_mocap_pose_to_sim().
@@ -125,8 +142,6 @@ def reset_root_state_uniform(
     For fixed-base robots, this is the ONLY way to position them per-environment.
     Without calling this function in a reset event, fixed-base robots will stack
     at (0,0,0).
-
-  See FAQ: "Why are my fixed-base robots all stacked at the origin?"
 
   Args:
     env: The environment.
@@ -139,10 +154,8 @@ def reset_root_state_uniform(
 
   asset: Entity = env.scene[asset_cfg.name]
 
-  # Pose.
   pose_samples = _sample_se3_range(pose_range, (len(env_ids), 6), env.device)
 
-  # Fixed-based entities with mocap=True.
   if asset.is_fixed_base:
     if not asset.is_mocap:
       raise ValueError(
@@ -166,7 +179,6 @@ def reset_root_state_uniform(
     )
     return
 
-  # Floating-base entities.
   default_root_state = asset.data.default_root_state
   assert default_root_state is not None
   root_states = default_root_state[env_ids].clone()
@@ -179,7 +191,6 @@ def reset_root_state_uniform(
   )
   orientations = quat_mul(root_states[:, 3:7], orientations_delta)
 
-  # Velocities.
   vel_samples = _sample_se3_range(velocity_range, (len(env_ids), 6), env.device)
   velocities = root_states[:, 7:13] + vel_samples
 
@@ -188,6 +199,94 @@ def reset_root_state_uniform(
   )
 
   asset.write_root_link_velocity_to_sim(velocities, env_ids=env_ids)
+
+
+def reset_fallen_state(
+  env: ManagerBasedRlEnv,
+  env_ids: torch.Tensor | None,
+  orientation_mode: str = "any",
+  height_range: tuple[float, float] = (0.0, 0.0),
+  position_xy_range: dict[str, tuple[float, float]] | None = None,
+  velocity_range: dict[str, tuple[float, float]] | None = None,
+  asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> None:
+  """Spawn the robot fallen, mid-tumble, or mid-motion for standup training.
+
+  Thin, self-documenting wrapper around `reset_root_state_uniform`. The
+  point of this function is naming the intent explicitly in your task cfg
+  rather than relying on someone reading raw roll/pitch numbers and
+  inferring "oh, this means fallen".
+
+  Note that "fallen" and "moving when the episode starts" are physically
+  different distributions, not one blended one -- a robot lying flat on the
+  ground does not also have high root velocity, and a robot that just
+  stopped running is unlikely to already be lying flat. Use
+  `orientation_mode` to pick which regime this call samples, and mix
+  multiple `EventTerm`s (each with their own probability/weight in your
+  event manager) if you want a curriculum across several fallen/moving
+  states rather than trying to cover all of them from a single call.
+
+  Args:
+    env: The environment.
+    env_ids: Environment IDs to reset. If None, resets all environments.
+    orientation_mode: One of:
+      - "any": uniform roll and pitch over the full range (any orientation,
+        including upside-down). Use for "robot is lying on the ground in
+        an arbitrary way".
+      - "side": roll randomized widely, pitch kept near zero -- robot on
+        its side rather than face-up/face-down. Useful if your robot's
+        get-up motion differs meaningfully by fall direction and you want
+        to isolate side-falls as their own training distribution.
+      - "near_upright": small roll/pitch perturbation only (e.g. +-30deg).
+        Use this for "was running/standing and got knocked off-balance or
+        pushed mid-standup", as distinct from a full fall -- pair with a
+        nonzero velocity_range.
+    height_range: Offset added to the default root height (m). For "any"/
+      "side" you typically want this near the robot's lying-down height
+      (often a small positive offset so it doesn't spawn clipped into the
+      ground); for "near_upright" leave near 0 since the default standing
+      height is already appropriate.
+    position_xy_range: Optional dict with "x"/"y" keys for randomizing spawn
+      position on top of env_origins; omitted keys default to no offset.
+    velocity_range: Root velocity range, same format as
+      `reset_root_state_uniform`. Use this for the "stopped from running"
+      case -- e.g. {"x": (-2.0, 2.0)} for residual forward velocity --
+      while leaving it at defaults (zero) for a settled fall.
+    asset_cfg: Asset configuration.
+  """
+  env_ids = resolve_env_ids(env, env_ids)
+
+  if orientation_mode == "any":
+    roll_range = (-3.14159, 3.14159)
+    pitch_range = (-3.14159, 3.14159)
+  elif orientation_mode == "side":
+    roll_range = (-3.14159, 3.14159)
+    pitch_range = (-0.2, 0.2)
+  elif orientation_mode == "near_upright":
+    roll_range = (-0.5, 0.5)
+    pitch_range = (-0.5, 0.5)
+  else:
+    raise ValueError(
+      f"Unknown orientation_mode '{orientation_mode}'; "
+      "expected 'any', 'side', or 'near_upright'."
+    )
+
+  pose_range: dict[str, tuple[float, float]] = {
+    "z": height_range,
+    "roll": roll_range,
+    "pitch": pitch_range,
+    "yaw": (-3.14159, 3.14159),
+  }
+  if position_xy_range is not None:
+    pose_range.update(position_xy_range)
+
+  reset_root_state_uniform(
+    env,
+    env_ids,
+    pose_range=pose_range,
+    velocity_range=velocity_range,
+    asset_cfg=asset_cfg,
+  )
 
 
 def reset_root_state_from_flat_patches(
@@ -199,6 +298,8 @@ def reset_root_state_from_flat_patches(
   asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> None:
   """Reset root state by placing the asset on a randomly chosen flat patch.
+  Unchanged -- still useful if you want standup training to happen on
+  varied/uneven terrain rather than only flat ground.
 
   Selects a random flat patch from the terrain for each environment and positions
   the asset there. Falls back to ``reset_root_state_uniform`` if the terrain has
@@ -229,11 +330,9 @@ def reset_root_state_from_flat_patches(
   patches = terrain.flat_patches[patch_name]  # (num_rows, num_cols, num_patches, 3)
   num_patches = patches.shape[2]
 
-  # Look up terrain level (row) and type (col) for each env.
   levels = terrain.terrain_levels[env_ids]
   types = terrain.terrain_types[env_ids]
 
-  # Randomly select a patch index for each env.
   patch_ids = torch.randint(0, num_patches, (len(env_ids),), device=env.device)
   positions = patches[levels, types, patch_ids]
 
@@ -242,10 +341,8 @@ def reset_root_state_from_flat_patches(
   assert default_root_state is not None
   root_states = default_root_state[env_ids].clone()
 
-  # Apply optional pose range offset.
   pose_samples = _sample_se3_range(pose_range, (len(env_ids), 6), env.device)
 
-  # Position: flat patch position + optional offset. Use patch z instead of default.
   final_positions = positions.clone()
   final_positions[:, 0] += pose_samples[:, 0]
   final_positions[:, 1] += pose_samples[:, 1]
@@ -266,7 +363,6 @@ def reset_root_state_from_flat_patches(
     )
     return
 
-  # Velocities.
   vel_samples = _sample_se3_range(velocity_range, (len(env_ids), 6), env.device)
   velocities = root_states[:, 7:13] + vel_samples
 
@@ -283,6 +379,10 @@ def reset_joints_by_offset(
   velocity_range: tuple[float, float],
   asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> None:
+  """Unchanged. Still useful: randomizing joint pose/vel at reset is equally
+  relevant whether the robot starts standing or fallen -- e.g. randomizing
+  limb positions while lying down so the policy doesn't overfit to one
+  exact fallen pose."""
   env_ids = resolve_env_ids(env, env_ids)
 
   asset: Entity = env.scene[asset_cfg.name]
@@ -320,11 +420,13 @@ def push_by_setting_velocity(
   asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> None:
   """Push an entity by overwriting its root velocity with a sampled offset.
+  Unchanged -- this is exactly your "someone pushed the robot while
+  standing up" mechanism. Use with ``mode="interval"`` so it fires
+  periodically during an episode, not just at reset.
 
   This is an *instantaneous, mass-independent* kick: it adds a uniformly sampled
   delta directly to the root velocity, ignoring inertia and contact dynamics. It
   is the cheapest disturbance and the standard locomotion "push the robot" term.
-  Use with ``mode="interval"``.
 
   For force-based disturbances that respect the entity's dynamics, see
   :func:`apply_external_force_torque` (a constant wrench you manage yourself) or
@@ -344,7 +446,7 @@ def apply_external_force_torque(
   torque_range: tuple[float, float],
   asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> None:
-  """Apply a single *constant* external wrench to bodies.
+  """Apply a single *constant* external wrench to bodies. Unchanged.
 
   Samples a force and torque once and writes them to ``xfrc_applied``. The wrench
   is **stateless and never expires**: MuJoCo holds it constant on every physics
@@ -384,7 +486,10 @@ def apply_external_force_torque(
 
 
 class apply_body_impulse:
-  """Apply random impulses to bodies for a sampled duration.
+  """Apply random impulses to bodies for a sampled duration. Unchanged --
+  this is the other half of your "pushed while standing up" requirement,
+  for repeated/randomized transient bumps during an episode rather than a
+  single push. Use with ``mode="step"``.
 
   Simulates transient external disturbances such as bumps, wind gusts, or
   collisions with unseen objects. A constant force/torque wrench is applied
@@ -410,8 +515,6 @@ class apply_body_impulse:
   torque via the cross product ``offset x force``, causing the body to tip rather than
   just translate. This is analogous to choosing where on the body an external push is
   applied.
-
-  Use with ``mode="step"``.
 
   For a *constant* episode-long wrench instead of transient impulses, see
   :func:`apply_external_force_torque`. For an instantaneous, mass-independent
@@ -456,8 +559,6 @@ class apply_body_impulse:
     self._cooldown_s: tuple[float, float] = cfg.params["cooldown_s"]
     self._time_remaining = torch.zeros(self._num_envs, device=self._device)
     self._active = torch.zeros(self._num_envs, device=self._device, dtype=torch.bool)
-    # Pre-sample the initial cooldown so the first impulse is preceded by a cooldown
-    # rather than firing immediately at t=0.
     self._interval_time_left = self._sample_cooldown(self._num_envs)
 
   def _sample_cooldown(self, n: int) -> torch.Tensor:
@@ -494,10 +595,8 @@ class apply_body_impulse:
     del env, env_ids, asset_cfg, cooldown_s  # Unused at call time.
     dt = self._step_dt
 
-    # Decrement timers for active envs.
     self._time_remaining[self._active] -= dt
 
-    # Clear expired impulses and resample their interval timers.
     expired = self._active & (self._time_remaining <= 0)
     if expired.any():
       expired_ids = expired.nonzero(as_tuple=False).squeeze(-1)
@@ -509,10 +608,8 @@ class apply_body_impulse:
       self._time_remaining[expired_ids] = 0.0
       self._interval_time_left[expired_ids] = self._sample_cooldown(len(expired_ids))
 
-    # Decrement interval timers.
     self._interval_time_left -= dt
 
-    # Trigger new impulses for eligible envs.
     eligible = (~self._active) & (self._interval_time_left <= 0)
     if not eligible.any():
       return
@@ -520,18 +617,15 @@ class apply_body_impulse:
     trigger_ids = eligible.nonzero(as_tuple=False).squeeze(-1)
     n = len(trigger_ids)
 
-    # Sample forces and torques.
     size = (n, self._num_bodies, 3)
     forces = sample_uniform(*force_range, size, self._device)
     torques = sample_uniform(*torque_range, size, self._device)
 
-    # Adjust torque for off-CoM application point.
     if body_point_offset is not None:
       offset_local = torch.tensor(
         body_point_offset, device=self._device, dtype=torch.float32
       )
       body_quat = self._asset.data.body_com_quat_w[trigger_ids][:, self._body_ids]
-      # Rotate offset into world frame: (n, num_bodies, 3).
       offset_w = quat_apply(
         body_quat.reshape(-1, 4), offset_local.expand(n * self._num_bodies, 3)
       ).reshape(n, self._num_bodies, 3)
@@ -541,14 +635,12 @@ class apply_body_impulse:
       forces, torques, env_ids=trigger_ids, body_ids=self._body_ids
     )
 
-    # Sample duration and set timers.
     dur_low, dur_high = duration_s
     self._time_remaining[trigger_ids] = (
       torch.rand(n, device=self._device) * (dur_high - dur_low) + dur_low
     )
     self._active[trigger_ids] = True
 
-    # Resample interval timers.
     self._interval_time_left[trigger_ids] = self._sample_cooldown(n)
 
   def debug_vis(self, visualizer: DebugVisualizer) -> None:
