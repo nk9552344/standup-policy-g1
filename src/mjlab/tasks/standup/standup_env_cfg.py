@@ -245,10 +245,11 @@ def make_standup_env_cfg() -> ManagerBasedRlEnvCfg:
       mode="reset",
       params={
         # Curriculum-controlled via fall_difficulty below; this is the
-        # starting (easiest) stage -- mild perturbation near upright, not
-        # a full random fall. fall_difficulty widens this to "any" as
-        # training advances.
-        "orientation_mode": "near_upright",
+        # starting (easiest) stage -- robot spawns fully upright so the
+        # policy can first learn balance and receive positive rewards before
+        # being asked to recover from falls. fall_difficulty progresses this
+        # through near_upright -> side -> any over training.
+        "orientation_mode": "standing",
         "height_range": (0.0, 0.0),
         "velocity_range": {},
       },
@@ -373,8 +374,14 @@ def make_standup_env_cfg() -> ManagerBasedRlEnvCfg:
       weight=0.0,  # Override per-robot
       params={"sensor_name": "robot/root_angmom"},
     ),
-    "dof_pos_limits": RewardTermCfg(func=mdp.joint_pos_limits, weight=-1.0),
-    "action_rate_l2": RewardTermCfg(func=mdp.action_rate_l2, weight=-0.1),
+    "dof_pos_limits": RewardTermCfg(func=mdp.joint_pos_limits, weight=-0.05),
+    # action_rate_l2 is unbounded (||a_t - a_{t-1}||^2). When the policy
+    # std grows (which happens early in training before convergence), this
+    # penalty grows quadratically and can dominate the reward signal,
+    # contributing to value-function divergence. Disable it for now;
+    # re-enable once the policy reliably stands and we want to smooth
+    # action trajectories.
+    "action_rate_l2": RewardTermCfg(func=mdp.action_rate_l2, weight=0.0),
     "self_collision": RewardTermCfg(
       func=mdp.self_collision_cost,
       weight=-0.1,  # Override per-robot.
@@ -401,7 +408,7 @@ def make_standup_env_cfg() -> ManagerBasedRlEnvCfg:
     "stuck_no_progress": TerminationTermCfg(
       func=mdp.stuck_no_progress,
       params={
-        "patience_s": 10.0,  # Tune: how long without height improvement
+        "patience_s": 15.0,  # Give the robot enough time to attempt recovery
         "min_improvement": 0.01,  # before giving up on this attempt.
         # Gate: don't terminate an env already at standing height.
         # Set per-robot to match min_standing_height used elsewhere.
@@ -437,21 +444,38 @@ def make_standup_env_cfg() -> ManagerBasedRlEnvCfg:
         "push_event_name": "push_robot",
         "fall_stages": [
           {
+            # Stage 0: default standing pose. Robot learns balance and
+            # collects strong positive rewards (upright, hold_still, pose)
+            # before ever seeing a fallen start state.
             "step": 0,
-            "orientation_mode": "near_upright",
+            "orientation_mode": "standing",
             "velocity_range": {},
             "push_force_range": None,
             "push_torque_range": None,
           },
           {
-            "step": 8000 * 24,  # was 5000 -- give near_upright stage more time to converge
+            # Stage 1: small tilt (+-0.3 rad / ~17 deg). Robot must now
+            # recover from a slight imbalance -- close to the balance task
+            # it already learned, so the transition is smooth.
+            "step": 3000 * 24,
+            "orientation_mode": "near_upright",
+            "velocity_range": {"x": (-0.5, 0.5), "y": (-0.5, 0.5)},
+            "push_force_range": None,
+            "push_torque_range": None,
+          },
+          {
+            # Stage 2: side falls. Roll randomized fully, pitch stays
+            # small. Robot must learn to roll back upright from its side.
+            "step": 10000 * 24,
             "orientation_mode": "side",
             "velocity_range": {"x": (-1.0, 1.0), "y": (-1.0, 1.0)},
             "push_force_range": None,
             "push_torque_range": None,
           },
           {
-            "step": 16000 * 24,  # was 10000 -- give side-fall stage more time to converge
+            # Stage 3: arbitrary orientation (face-down, face-up, any).
+            # Full recovery from any fallen state.
+            "step": 20000 * 24,
             "orientation_mode": "any",
             "velocity_range": {
               "x": (-2.0, 2.0),

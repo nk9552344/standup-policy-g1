@@ -237,10 +237,12 @@ def reset_fallen_state(
         its side rather than face-up/face-down. Useful if your robot's
         get-up motion differs meaningfully by fall direction and you want
         to isolate side-falls as their own training distribution.
-      - "near_upright": small roll/pitch perturbation only (e.g. +-30deg).
+      - "near_upright": small roll/pitch perturbation (+-0.3 rad / ~17 deg).
         Use this for "was running/standing and got knocked off-balance or
         pushed mid-standup", as distinct from a full fall -- pair with a
         nonzero velocity_range.
+      - "standing": yaw-only randomization, no tilt. Use as the first
+        curriculum stage so the policy learns balance before recovery.
     height_range: Offset added to the default root height (m). For "any"/
       "side" you typically want this near the robot's lying-down height
       (often a small positive offset so it doesn't spawn clipped into the
@@ -263,12 +265,18 @@ def reset_fallen_state(
     roll_range = (-3.14159, 3.14159)
     pitch_range = (-0.2, 0.2)
   elif orientation_mode == "near_upright":
-    roll_range = (-0.5, 0.5)
-    pitch_range = (-0.5, 0.5)
+    roll_range = (-0.3, 0.3)
+    pitch_range = (-0.3, 0.3)
+  elif orientation_mode == "standing":
+    # No tilt -- only yaw is randomized (below). Use as the first curriculum
+    # stage: robot spawns fully upright so the policy can learn balance and
+    # the hold_still / pose / upright rewards before facing harder falls.
+    roll_range = (0.0, 0.0)
+    pitch_range = (0.0, 0.0)
   else:
     raise ValueError(
       f"Unknown orientation_mode '{orientation_mode}'; "
-      "expected 'any', 'side', or 'near_upright'."
+      "expected 'any', 'side', 'near_upright', or 'standing'."
     )
 
   pose_range: dict[str, tuple[float, float]] = {

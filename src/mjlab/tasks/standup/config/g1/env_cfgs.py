@@ -165,7 +165,13 @@ def unitree_g1_rough_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   # (~the same magnitude of motion freedom needed for a get-up motion as for
   # a walking stride); the original running std values are dropped, since
   # standup has no equivalent "running" regime.
-  cfg.rewards["pose"].params["std_standing"] = {".*": 0.05}
+  # std_standing was 0.15 (uniform across all joints) -- that's an extremely
+  # tight tolerance: exp(-error^2 / 0.15^2) drops to ~0.01 by ~0.3 rad
+  # deviation, so any noise in early-training actions instantly zeros out
+  # this reward and gives no learning gradient. 0.25 is loose enough for
+  # the policy to receive a useful per-step signal while still rewarding
+  # the converged policy for tight default-pose tracking.
+  cfg.rewards["pose"].params["std_standing"] = {".*": 0.25}
   cfg.rewards["pose"].params["std_recovering"] = {
     # Lower body.
     r".*hip_pitch.*": 0.3,
@@ -189,8 +195,19 @@ def unitree_g1_rough_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   cfg.rewards["upright"].params["asset_cfg"].body_names = ("torso_link",)
   cfg.rewards["body_ang_vel"].params["asset_cfg"].body_names = ("torso_link",)
 
-  cfg.rewards["body_ang_vel"].weight = -0.05
-  cfg.rewards["angular_momentum"].weight = -0.02
+  # Both body_ang_vel and angular_momentum use unbounded squared-magnitude
+  # kernels (sum(square(ang_vel)) and sum(square(angmom))). When the
+  # policy collapses into chaotic flailing -- which it did at iter ~700 in
+  # the last run -- angular velocities of ~50-100 rad/s produce per-step
+  # penalties of -250 to -1000, which over a 1000-step episode sums to
+  # -250k to -1M reward. The value function cannot fit a target that
+  # large, diverges to ~1e11, and the resulting catastrophic policy
+  # gradient destroys the policy. Disable both for now; they're penalty
+  # shaping for already-stable behavior, not signals that help discover
+  # the standup behavior. Re-enable with bounded kernels (e.g.
+  # exp(-x^2/std^2)) once the policy can reliably stand.
+  cfg.rewards["body_ang_vel"].weight = 0.0
+  cfg.rewards["angular_momentum"].weight = 0.0
 
   # G1 standing height overrides -- these must all use the same definition
   # of "standing" so hold_still, pose, curriculum, and termination are
@@ -206,7 +223,7 @@ def unitree_g1_rough_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   # weight, rather than adding a second duplicate reward term.
   cfg.rewards["self_collision"].params["sensor_name"] = self_collision_cfg.name
   cfg.rewards["self_collision"].params["force_threshold"] = 10.0
-  cfg.rewards["self_collision"].weight = -1.0
+  cfg.rewards["self_collision"].weight = -0.2
 
   # air_time, foot_clearance, foot_slip overrides removed: these reward
   # terms don't exist in standup_env_cfg.py (dropped upstream as gait-cycle-

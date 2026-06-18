@@ -181,11 +181,20 @@ class stuck_no_progress:
     )
 
     stuck = self._stall_time > patience_s
-    # Don't terminate an env that has already reached standing height --
-    # holding still at full stand is success, not stalling. Only fire when
-    # the robot is below standing height and making no upward progress.
-    already_standing = height >= min_standing_height
-    return stuck & ~already_standing
+    # Don't terminate an env that has *ever* reached standing height during
+    # this episode. Once the robot has stood (e.g. spawned standing in the
+    # curriculum's stage-0 stand-and-balance task, or successfully recovered
+    # from a fall mid-episode), the rest of the episode is about *staying*
+    # upright -- transient dips below `min_standing_height` while balancing
+    # or recovering from a push must not be treated as a stalled attempt.
+    # The previous gate (`current_height >= min_standing_height`) was too
+    # strict: spawn-standing episodes that toppled in the first frame got
+    # terminated at exactly `patience_s` every single time, since
+    # `_best_height` was set to spawn height on step 1 and could never
+    # improve again, and the gate immediately flipped to False once the
+    # robot fell below `min_standing_height`.
+    ever_standing = self._best_height >= min_standing_height
+    return stuck & ~ever_standing
 
   def reset(self, env_ids: torch.Tensor) -> None:
     self._best_height[env_ids] = float("-inf")
