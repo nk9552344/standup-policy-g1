@@ -41,15 +41,28 @@ def unitree_g1_ppo_runner_cfg() -> RslRlOnPolicyRunnerCfg:
       obs_normalization=True,
       distribution_cfg={
         "class_name": "GaussianDistribution",
-        # init_std=0.2 was still too large: training graphs showed Loss/
-        # entropy *rising* monotonically (policy std growing) and
-        # Metrics/mean_action_acc climbing, i.e. the policy becoming more
-        # chaotic over training, not converging. Drop to 0.1 so the
-        # initial policy is essentially "hold default pose with small
-        # exploration" -- the std will grow on its own from surrogate
-        # gradients if larger exploration genuinely helps.
+        # FREEZE THE POLICY STD. Across every previous run, Policy/mean_std
+        # grew monotonically (0.1 -> 0.18 -> 0.28...) regardless of
+        # entropy_coef (tried 0.03, 0.005, 0.001, 0.0). The mechanism is
+        # PPO's surrogate gradient on log_std: with noisy bounded rewards
+        # like standup_progress, outlier actions occasionally hit positive
+        # advantage, which pushes log_std up. There is no counter-force
+        # (entropy_coef=0 doesn't shrink std, it just removes the bias to
+        # grow it). The growing std then physically prevents the robot
+        # from holding the standing pose, so the exp-form rewards (pose,
+        # upright, hold_still) collapse to ~0, leaving only the noisy
+        # standup_progress signal -- a self-reinforcing failure mode.
+        #
+        # learn_std=False fixes std at init_std and removes log_std from
+        # the optimizer entirely, breaking the feedback loop. The policy
+        # must improve by shaping the *mean* action, which is exactly
+        # what we want for a "hold default pose" task. init_std=0.1 gives
+        # ~0.1 rad per joint exploration noise -- enough to discover the
+        # standup gradient without making the robot vibrate so much it
+        # can't earn the still-standing rewards.
         "init_std": 0.1,
         "std_type": "scalar",
+        "learn_std": False,
       },
     ),
     critic=RslRlModelCfg(

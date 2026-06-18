@@ -135,7 +135,22 @@ def unitree_g1_rough_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
 
   joint_pos_action = cfg.actions["joint_pos"]
   assert isinstance(joint_pos_action, JointPositionActionCfg)
-  joint_pos_action.scale = G1_ACTION_SCALE
+  # SHRINK THE ACTION SCALE FOR STANDUP. G1_ACTION_SCALE is tuned for
+  # locomotion (knee ~0.35 rad per unit raw action), which is fine for a
+  # walking gait. But for standup -- especially stage 0 where the robot
+  # spawns standing and the optimal policy is "output ~0 to hold default
+  # pose" -- this scale is way too large for bootstrapping. At iter 0
+  # the actor MLP outputs random values with magnitude ~1.0 per dim, so
+  # every joint is commanded ~0.35 rad off default at step 0 *before* any
+  # learning has happened. The robot is jerked out of the default pose
+  # immediately and the policy has to first un-learn this random offset
+  # before any pose/upright reward can fire. Multiplying by 0.25 makes
+  # the worst-case random-init action only ~0.09 rad off default per
+  # joint, which the actuators can hold near default pose, so pose/
+  # upright rewards fire from iter 0 and bootstrap learning. Scale this
+  # back up once the policy can reliably hold default pose, since harder
+  # curriculum stages (recovery from prone) need larger action ranges.
+  joint_pos_action.scale = {k: v * 0.25 for k, v in G1_ACTION_SCALE.items()}
 
   cfg.viewer.body_name = "torso_link"
 
@@ -194,6 +209,42 @@ def unitree_g1_rough_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
 
   cfg.rewards["upright"].params["asset_cfg"].body_names = ("torso_link",)
   cfg.rewards["body_ang_vel"].params["asset_cfg"].body_names = ("torso_link",)
+
+  # REWARD REBALANCING. The previous setup had standup_progress (weight
+  # 5.0, max ~15/step) dominating pose (weight 1.0, max 1/step) and
+  # upright (weight 2.0, max 2/step) by ~15:1. Standup_progress only
+  # requires "vaguely upright at decent height" to fire, so the policy
+  # converged to a non-default upright attractor where pose reward stayed
+  # pinned at ~0.01 for the entire run. Episode_Reward/pose was flat at
+  # 0.01 for 1000+ iterations, which is the signature of a stable local
+  # optimum that doesn't include the default pose.
+  #
+  # New balance (per-step weighted max, in default-pose standing state):
+  #   pose:             10.0  (was 1.0)  -- dominant attractor toward
+  #                                          *default* pose specifically
+  #   upright:           5.0  (was 2.0)  -- bounded vertical attractor
+  #   hold_still:        2.0  (unchanged) -- low-velocity, gated
+  #   standup_progress:  2.0  (was 5.0)  -- shaping signal, no longer
+  #                                          drowns out the others
+  # Total max per step ~19, vs ~10/step achievable from "any upright
+  # non-default pose", so the default-pose attractor wins. Pose at weight
+  # 10 with std_standing=0.25 still has exp(-error^2/0.25^2) bounded in
+  # [0, 10], so no risk of value-function divergence.
+  cfg.rewards["pose"].weight = 10.0
+  cfg.rewards["upright"].weight = 5.0
+  cfg.rewards["standup_progress"].weight = 2.0
+
+  # LOWER THE STANDING-GATE TOLERANCE. min_standing_uprightness=0.8 means
+  # the robot must be tilted < cos^-1(0.8) ~ 37 degrees from vertical for
+  # pose to use the tight std_standing band and for hold_still to fire at
+  # all. Early in training the robot wobbles past this threshold easily,
+  # causing pose to switch to the loose std_recovering band (weak
+  # gradient) and hold_still to drop to 0 (no signal at all). Lowering to
+  # 0.5 (~60 degrees of tilt allowed) keeps the tight, informative reward
+  # signal active through the wobbling phase so the policy has a clear
+  # gradient back toward upright + default pose.
+  cfg.rewards["pose"].params["min_standing_uprightness"] = 0.5
+  cfg.rewards["hold_still"].params["min_standing_uprightness"] = 0.5
 
   # Both body_ang_vel and angular_momentum use unbounded squared-magnitude
   # kernels (sum(square(ang_vel)) and sum(square(angmom))). When the
