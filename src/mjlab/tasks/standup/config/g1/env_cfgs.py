@@ -299,6 +299,9 @@ def unitree_g1_rough_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   cfg.rewards["hold_still"].params["min_standing_height"] = _G1_MIN_STANDING_HEIGHT
   cfg.rewards["pose"].params["min_standing_height"] = _G1_MIN_STANDING_HEIGHT
   cfg.curriculum["terrain_levels"].params["min_standing_height"] = _G1_MIN_STANDING_HEIGHT
+  # Keep terrain frozen at level 0 until Stage 1 of fall_difficulty so the
+  # robot masters balance on easy terrain before facing rough terrain.
+  cfg.curriculum["terrain_levels"].params["min_step_counter"] = 3000 * 24
   cfg.terminations["stuck_no_progress"].params["min_standing_height"] = _G1_MIN_STANDING_HEIGHT
 
   # Wire the generic self_collision placeholder (defined in

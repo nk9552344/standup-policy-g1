@@ -79,6 +79,7 @@ def terrain_levels_standup(
   env_ids: torch.Tensor,
   min_standing_height: float,
   min_standing_uprightness: float = 0.8,
+  min_step_counter: int = 0,
   asset_cfg: SceneEntityCfg = _DEFAULT_SCENE_CFG,
 ) -> dict[str, torch.Tensor]:
   """Progress/regress terrain difficulty based on standup success.
@@ -87,11 +88,25 @@ def terrain_levels_standup(
   standing pose (height + uprightness gate, same definition used in
   reward/termination) by the time this episode ended. Envs that succeeded
   move to harder terrain; envs that failed move to easier terrain.
+
+  ``min_step_counter`` gates all terrain advancement until the training has
+  reached that step count. Set it to match the fall_difficulty Stage 1
+  threshold so the robot masters flat/easy terrain before being exposed to
+  rough terrain. Without this gate, every robot that successfully stands
+  in Stage 0 immediately advances to harder terrain -- the curriculum then
+  oscillates between the robot succeeding on easy terrain and failing on
+  hard terrain, destabilising training.
   """
   terrain = env.scene.terrain
   assert terrain is not None
   terrain_generator = terrain.cfg.terrain_generator
   assert terrain_generator is not None
+
+  # Don't advance terrain until the minimum step threshold is reached.
+  # All envs stay at their current level; only log terrain stats.
+  if env.common_step_counter < min_step_counter:
+    levels = terrain.terrain_levels.float()
+    return {"mean": torch.mean(levels), "max": torch.max(levels)}
 
   succeeded = _is_standing(
     env, env_ids, asset_cfg, min_standing_height, min_standing_uprightness
@@ -126,6 +141,11 @@ class FallStage(TypedDict):
   velocity_range: dict[str, tuple[float, float]] | None
   push_force_range: tuple[float, float] | None
   push_torque_range: tuple[float, float] | None
+  push_velocity_range: dict[str, tuple[float, float]] | None
+  """Velocity range for push_by_setting_velocity. Replaces the entire
+  velocity_range dict in the push event's params when not None. Use this
+  to enable/escalate push disturbances in later curriculum stages (Stage 0
+  should always be None so the robot learns balance before facing pushes)."""
 
 
 def fall_difficulty(
@@ -177,6 +197,8 @@ def fall_difficulty(
           push_cfg.params["force_range"] = stage["push_force_range"]
         if stage.get("push_torque_range") is not None:
           push_cfg.params["torque_range"] = stage["push_torque_range"]
+        if stage.get("push_velocity_range") is not None:
+          push_cfg.params["velocity_range"] = stage["push_velocity_range"]
 
   log: dict[str, torch.Tensor] = {
     "orientation_mode_is_any": torch.tensor(

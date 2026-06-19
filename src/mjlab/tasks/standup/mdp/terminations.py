@@ -181,20 +181,20 @@ class stuck_no_progress:
     )
 
     stuck = self._stall_time > patience_s
-    # Don't terminate an env that has *ever* reached standing height during
-    # this episode. Once the robot has stood (e.g. spawned standing in the
-    # curriculum's stage-0 stand-and-balance task, or successfully recovered
-    # from a fall mid-episode), the rest of the episode is about *staying*
-    # upright -- transient dips below `min_standing_height` while balancing
-    # or recovering from a push must not be treated as a stalled attempt.
-    # The previous gate (`current_height >= min_standing_height`) was too
-    # strict: spawn-standing episodes that toppled in the first frame got
-    # terminated at exactly `patience_s` every single time, since
-    # `_best_height` was set to spawn height on step 1 and could never
-    # improve again, and the gate immediately flipped to False once the
-    # robot fell below `min_standing_height`.
-    ever_standing = self._best_height >= min_standing_height
-    return stuck & ~ever_standing
+    # Don't terminate an env that is *currently* at or above standing height.
+    # Robots that are standing (even if they've been stationary for a while,
+    # e.g. holding the standing pose) must never be cut off. Only terminate
+    # robots that are *currently below* standing height and haven't improved
+    # for `patience_s` seconds -- those are genuinely stuck on the ground.
+    #
+    # The previous `ever_standing` gate (`_best_height >= min_standing_height`)
+    # was wrong: it becomes True at step 1 for any robot that spawns from
+    # HOME_KEYFRAME (height 0.783m > 0.65m), so stuck & ~ever_standing was
+    # always False. Episodes ran to full time_out with the robot lying on the
+    # ground for 17-19 s after being pushed, generating long stretches of
+    # near-zero reward that destabilised the value function.
+    currently_standing = height >= min_standing_height
+    return stuck & ~currently_standing
 
   def reset(self, env_ids: torch.Tensor) -> None:
     self._best_height[env_ids] = float("-inf")

@@ -266,20 +266,15 @@ def make_standup_env_cfg() -> ManagerBasedRlEnvCfg:
     "push_robot": EventTermCfg(
       func=mdp.push_by_setting_velocity,
       mode="interval",
-      interval_range_s=(8.0, 15.0),  # was (1.0, 3.0); give the robot time to stand before being pushed again
+      interval_range_s=(8.0, 15.0),
       params={
-        # Unchanged from locomotion -- already exactly the "someone pushed
-        # the robot while standing up" mechanism. fall_difficulty widens
-        # these ranges over training the same way it widens reset_base's
-        # orientation_mode/velocity_range.
-        "velocity_range": {
-          "x": (-0.5, 0.5),
-          "y": (-0.5, 0.5),
-          "z": (-0.4, 0.4),
-          "roll": (-0.52, 0.52),
-          "pitch": (-0.52, 0.52),
-          "yaw": (-0.78, 0.78),
-        },
+        # Stage 0: no push at all. A ±0.5 m/s push at iteration 0 knocks
+        # the robot over before it has learned any balance, then it lies on
+        # the ground for the rest of the episode collecting "pose" reward
+        # in std_recovering mode. The policy learns to be a limp ragdoll
+        # instead of learning to stand. fall_difficulty escalates this
+        # velocity in Stage 1+ once the robot can maintain balance.
+        "velocity_range": {},
       },
     ),
     "foot_friction": EventTermCfg(
@@ -408,9 +403,15 @@ def make_standup_env_cfg() -> ManagerBasedRlEnvCfg:
     "stuck_no_progress": TerminationTermCfg(
       func=mdp.stuck_no_progress,
       params={
-        "patience_s": 15.0,  # Give the robot enough time to attempt recovery
-        "min_improvement": 0.01,  # before giving up on this attempt.
-        # Gate: don't terminate an env already at standing height.
+        # Must be < (episode_length_s - min(push_interval_s)) to actually
+        # fire within an episode after a push knocks the robot over.
+        # With episode_length_s=20 and interval_range_s=(8,15), a push
+        # at t=8s + patience_s=8s = termination at t=16s < 20s. ✓
+        # patience_s=15 was too long: push at t=10s + 15s = 25s > 20s,
+        # so stuck_no_progress never fired and episodes always timed out.
+        "patience_s": 8.0,
+        "min_improvement": 0.01,
+        # Gate: don't terminate an env that is currently at standing height.
         # Set per-robot to match min_standing_height used elsewhere.
         "min_standing_height": MIN_STANDING_HEIGHT,
       },
@@ -435,6 +436,13 @@ def make_standup_env_cfg() -> ManagerBasedRlEnvCfg:
       params={
         "min_standing_height": MIN_STANDING_HEIGHT,
         "min_standing_uprightness": 0.8,
+        # Don't advance terrain until Stage 1 of fall_difficulty (step
+        # 3000*24). This ensures the robot first masters balance on easy
+        # terrain before being exposed to rough terrain. Without this gate,
+        # any robot successfully standing in Stage 0 immediately advances to
+        # harder terrain, causing the boom-bust oscillation that crashed
+        # pose/upright rewards at iter ~400 in earlier runs.
+        "min_step_counter": 3000 * 24,
       },
     ),
     "fall_difficulty": CurriculumTermCfg(
@@ -446,31 +454,50 @@ def make_standup_env_cfg() -> ManagerBasedRlEnvCfg:
           {
             # Stage 0: default standing pose. Robot learns balance and
             # collects strong positive rewards (upright, hold_still, pose)
-            # before ever seeing a fallen start state.
+            # before ever seeing a fallen start state. No push disturbance
+            # in this stage: full-strength pushes before balance is learned
+            # cause the robot to fall and lie on the ground for 10+ seconds
+            # per episode, learning to be a limp ragdoll instead of standing.
             "step": 0,
             "orientation_mode": "standing",
             "velocity_range": {},
             "push_force_range": None,
             "push_torque_range": None,
+            "push_velocity_range": None,  # No push in Stage 0.
           },
           {
             # Stage 1: small tilt (+-0.3 rad / ~17 deg). Robot must now
             # recover from a slight imbalance -- close to the balance task
-            # it already learned, so the transition is smooth.
+            # it already learned, so the transition is smooth. Enable light
+            # pushes now that the robot can maintain balance.
             "step": 3000 * 24,
             "orientation_mode": "near_upright",
             "velocity_range": {"x": (-0.5, 0.5), "y": (-0.5, 0.5)},
             "push_force_range": None,
             "push_torque_range": None,
+            "push_velocity_range": {
+              "x": (-0.3, 0.3),
+              "y": (-0.3, 0.3),
+              "z": (-0.2, 0.2),
+            },
           },
           {
             # Stage 2: side falls. Roll randomized fully, pitch stays
             # small. Robot must learn to roll back upright from its side.
+            # Full push velocity enabled.
             "step": 10000 * 24,
             "orientation_mode": "side",
             "velocity_range": {"x": (-1.0, 1.0), "y": (-1.0, 1.0)},
             "push_force_range": None,
             "push_torque_range": None,
+            "push_velocity_range": {
+              "x": (-0.5, 0.5),
+              "y": (-0.5, 0.5),
+              "z": (-0.4, 0.4),
+              "roll": (-0.52, 0.52),
+              "pitch": (-0.52, 0.52),
+              "yaw": (-0.78, 0.78),
+            },
           },
           {
             # Stage 3: arbitrary orientation (face-down, face-up, any).
@@ -486,6 +513,7 @@ def make_standup_env_cfg() -> ManagerBasedRlEnvCfg:
             },
             "push_force_range": None,
             "push_torque_range": None,
+            "push_velocity_range": None,  # Keep Stage 2 push range.
           },
         ],
       },
@@ -501,7 +529,11 @@ def make_standup_env_cfg() -> ManagerBasedRlEnvCfg:
       terrain=TerrainEntityCfg(
         terrain_type="generator",
         terrain_generator=replace(ROUGH_TERRAINS_CFG),
-        max_init_terrain_level=5,
+        # Start all envs at the easiest terrain (level 0). The curriculum
+        # advances them as they succeed. Starting at 5 meant half the robots
+        # immediately faced rough terrain before any policy existed, causing
+        # rapid terrain-level oscillation that corrupted the value function.
+        max_init_terrain_level=0,
       ),
       sensors=(terrain_scan, foot_height_scan),
       num_envs=1,
