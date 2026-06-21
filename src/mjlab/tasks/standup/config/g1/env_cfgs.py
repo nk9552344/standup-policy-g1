@@ -186,24 +186,34 @@ def unitree_g1_rough_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   cfg.rewards["upright"].params["asset_cfg"].body_names = ("torso_link",)
   cfg.rewards["body_ang_vel"].params["asset_cfg"].body_names = ("torso_link",)
 
-  # TIGHTEN UPRIGHT GRADIENT. Default std=sqrt(0.2)=0.447 makes
-  # exp(-xy^2/std^2) nearly flat for small tilts: at 10 degrees off
-  # vertical xy^2=0.030, reward=exp(-0.030/0.2)=0.86 -- barely different
-  # from the perfect-upright reward of 1.0. The policy receives almost no
-  # signal that it is tilting until it is already far from vertical and
-  # near the floor. std=sqrt(0.05)=0.224 sharpens the curve so that at
-  # 10 degrees xy^2=0.030, reward=exp(-0.030/0.05)=0.55 -- a clear,
-  # actionable gradient that pulls the policy back toward vertical before
-  # the robot has toppled.
-  cfg.rewards["upright"].params["std"] = 0.05 ** 0.5
+  # UPRIGHT STD -- calibrated to the robot's OPERATING TILT RANGE, not to
+  # the ideal "near-perfect" range. The gradient the policy receives is
+  # proportional to w * kernel / std², where kernel = exp(-xy²/std²).
+  # If std is too tight, the kernel is near-zero at the robot's actual
+  # operating tilt, killing the gradient exactly when the policy needs it
+  # most. Evidence: at std=sqrt(0.05)=0.224, a 20° tilt gives
+  # kernel=exp(-0.117/0.05)=0.096 and gradient-factor=5*0.096/0.05=9.6.
+  # At std=sqrt(0.117)=0.342 (calibrated to 20°: sin²(20°)=0.117),
+  # the same 20° tilt gives kernel=exp(-1)=0.368 and gradient-factor
+  # =10*0.368/0.117=31.4 -- 3.3× stronger signal right where the robot
+  # operates, making corrective actions actually learnable.
+  #
+  # The previous comment here (claiming tighter std gives "more actionable
+  # gradient") was wrong: the exp gradient is proportional to KERNEL, so
+  # a tight std that drives the kernel to ~0 at operating tilts produces
+  # WEAKER, not stronger, gradients for the policy to learn from.
+  cfg.rewards["upright"].params["std"] = 0.117 ** 0.5  # sin²(20°)=0.117
 
   # Reward balance (per-step weighted max, in default-pose standing state):
-  #   pose:       10.0 -- dominant attractor toward *default* pose
-  #   upright:     5.0 -- bounded vertical attractor
+  #   upright:    10.0 -- PRIMARY signal; must dominate for balance to be learned
+  #   pose:        2.0 -- SECONDARY regularization toward default joint config
   #   hold_still:  2.0 -- low-velocity penalty
-  # Total max per step ~17. pose with std=0.25 is bounded in [0, 10].
-  cfg.rewards["pose"].weight = 10.0
-  cfg.rewards["upright"].weight = 5.0
+  # Total max per step ~14. upright must outweigh pose so the policy learns
+  # to prioritize staying vertical over returning to default joint positions.
+  # Inverted weights (pose=10, upright=5) caused the policy to learn pose-
+  # tracking actions that actively destabilized balance (confirmed in training).
+  cfg.rewards["upright"].weight = 10.0
+  cfg.rewards["pose"].weight = 2.0
 
   # body_ang_vel and angular_momentum now use bounded exp(-x²/std²) kernels
   # (see rewards.py), but they are stability-shaping signals for a policy

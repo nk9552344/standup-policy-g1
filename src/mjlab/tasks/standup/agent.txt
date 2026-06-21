@@ -399,15 +399,15 @@ File: config/g1/env_cfgs.py (key G1-specific overrides)
   init_state = HOME_KEYFRAME (hip_pitch=-0.1, knee=0.3, ankle=-0.2)
   joint_pos_action.scale = G1_ACTION_SCALE * 0.25
   pose.params["std_values"] = {".*": 0.25}
-  pose.weight = 10.0
-  upright.weight = 5.0
-  upright.params["std"] = 0.05 ** 0.5  (sharp gradient, ~0.224)
+  upright.weight = 10.0   ← PRIMARY signal (was 5.0)
+  pose.weight = 2.0        ← secondary regularization (was 10.0)
+  upright.params["std"] = 0.117 ** 0.5  ← calibrated to 20° tilt (was 0.05**0.5)
   body_ang_vel.weight = 0.0      ← disabled until robot can stand
   angular_momentum.weight = 0.0  ← disabled until robot can stand
   action_rate_l2.weight = 0.0    ← disabled until robot can stand
   terrain_levels.params["min_standing_height"] = 0.65
-  fell_over.params["min_height"] = 0.45       ← key fix
-  fell_over.params["min_uprightness"] = 0.2   ← key fix
+  fell_over.params["min_height"] = 0.45       ← key fix from session 2
+  fell_over.params["min_uprightness"] = 0.2   ← key fix from session 2
 
 File: standup_env_cfg.py (base config)
   MIN_STANDING_HEIGHT = 0.5  (base default for fell_over; G1 overrides to 0.45)
@@ -572,5 +572,85 @@ Format + lint:
 Or via Makefile:
   make check   = format + lint + type check
   make test    = full test suite
+
+================================================================================
+12. TRAINING FAILURE DIAGNOSIS — SESSION 3 (2026-06-21)
+================================================================================
+
+Training showed: rewards declining after 2.5k steps, crash at 3.8k.
+User observation: "robot takes small actions to stay standing but sometimes
+falls faster than doing nothing."
+
+CHARTS OBSERVED:
+  - Train/mean_reward: 12→14 (step 0-2.5k), then declining, crash 11→5 at 3.8k
+  - Episode_Reward/upright: 0.05-0.3, very low and declining
+  - Episode_Reward/pose: 0.5-1.0, declining after step 3k
+  - Episode_Reward/hold_still: 0.01-0.03 (robot moving fast)
+  - Policy/mean_std = 0.3 flat (learn_std=False working correctly)
+  - Loss/entropy ≈ 6.0 flat (matches 29-dim Gaussian at std=0.3 analytically)
+
+ROOT CAUSE 1 (CRITICAL): upright std too tight — gradient vanishes at operating tilt
+────────────────────────────────────────────────────────────────────────────────
+
+Gradient of upright reward for policy = w * kernel / std²
+                                      = w * exp(-xy²/std²) / std²
+
+With old std=√0.05=0.224, at 20° tilt (xy²=sin²20°=0.117):
+  kernel = exp(-0.117/0.05) = 0.096    ← near-zero
+  gradient-factor = 5.0 * 0.096 / 0.05 = 9.6
+
+With new std=√0.117=0.342, at 20° tilt:
+  kernel = exp(-0.117/0.117) = exp(-1) = 0.368
+  gradient-factor = 10.0 * 0.368 / 0.117 = 31.4  ← 3.3× improvement
+
+The old reasoning ("tighter std gives clearer gradient") was WRONG.
+The gradient magnitude = kernel / std². A near-zero kernel gives near-zero
+gradient — the tightest std is the worst choice when the kernel collapses
+to zero at the robot's operating range.
+
+ROOT CAUSE 2 (CRITICAL): pose weight (10) > upright weight (5) — inverted
+────────────────────────────────────────────────────────────────────────────────
+
+For a balance task, upright MUST dominate. With old weights:
+- When robot tilts and policy makes corrective ankle action:
+  * The ankle moves away from HOME_KEYFRAME → pose reward DECREASES
+  * The tilt starts correcting → upright reward INCREASES
+  * With w_pose=10 >> w_upright=5, pose penalty > upright benefit
+  * Policy gradient DISCOURAGES the corrective action
+- Result: policy learned to return joints to HOME_KEYFRAME (strong pose
+  gradient) even when this destabilizes balance. "Actions make it fall
+  faster" is exactly this: pose-tracking actions actively fighting balance.
+
+Reference: Isaac Lab G1 locomotion uses flat_orientation_l2.weight=-1.0
+(L2 PENALTY) and joint_deviation.weight=-0.05 to -0.1 (tiny secondary).
+Orientation is never the PRIMARY reward in any known G1 balance/locomotion
+policy — pose is always secondary.
+
+ROOT CAUSE 3: Terrain curriculum crash at 3.8k (secondary)
+────────────────────────────────────────────────────────────────────────────────
+
+terrain_levels_standup advances when: at episode end, uprightness > 0.8
+(= cos(37°)). A robot wobbling at 20° average tilt (uprightness=0.94 > 0.8)
+passes this check and gets promoted to harder terrain where it fails.
+
+The crash at step 3.8k (sudden 11→5 drop, partial recovery to 8) is
+consistent with curriculum over-promotion → failure on rough terrain.
+
+NOT YET FIXED: Will improve naturally once balance reward is corrected.
+Consider tightening to min_standing_uprightness=0.95 if crashes persist.
+
+FIXES APPLIED (session 3):
+────────────────────────────────────────────────────────────────────────────────
+
+  File: vsls:/src/mjlab/tasks/standup/config/g1/env_cfgs.py
+  1. upright.params["std"]: 0.05**0.5 → 0.117**0.5 (sin²(20°), operating range)
+  2. upright.weight:          5.0 → 10.0 (PRIMARY signal)
+  3. pose.weight:            10.0 → 2.0 (secondary regularization)
+
+EXPECTED EFFECT ON CHARTS:
+  - Episode_Reward/upright: should rise significantly (kernel 0.37 vs 0.10 at 20°)
+  - Episode_Reward/pose: will drop (lower weight) but that's intentional
+  - mean_reward scale will shift (upright now 10 = bigger positive term)
+  - Policy should learn CORRECTIVE ACTIONS that actually reduce tilt
 
 ================================================================================
