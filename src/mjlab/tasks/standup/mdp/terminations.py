@@ -1,56 +1,33 @@
-"""Useful methods for MDP terminations.
+"""Useful methods for MDP terminations for the stay-stand (balance) policy.
 
-Forked from the REAL mjlab.tasks.velocity.mdp.termination.py (time_out,
-illegal_contact, out_of_terrain_bounds, terrain_edge_reached) -- a previous
-version of this file in this conversation was mistakenly based on a
-different, shorter termination.py (time_out, bad_orientation,
-root_height_below_minimum, nan_detection) and should be considered
-superseded by this one.
+Forked from the standup recovery terminations.py. Key differences:
 
-Per-term conversion:
+  - fell_over: NEW (restored from the original velocity locomotion policy's
+    bad_orientation term). In recovery this term was dropped because the
+    robot starts fallen and "being badly oriented" is the whole premise.
+    In stay-stand the robot starts upright; any tilt past the threshold
+    IS a failure and must terminate the episode immediately. This is the
+    primary failure signal for the stay-stand task.
 
-  - time_out: unchanged. Episode length cutoff is task-agnostic.
-  - illegal_contact: DROPPED ENTIRELY for standup. This term terminates
-    when a forbidden body part (e.g. knee, hand, torso -- whatever your
-    locomotion config wires it to) touches the ground above a force
-    threshold. In locomotion that's always a failure (the robot scuffed or
-    fell). In standup it's the opposite: hands pushing off the ground,
-    knees touching down, rolling onto the torso or a side are the expected,
-    necessary mechanics of getting up. Keeping this verbatim would
-    terminate nearly every standup episode immediately, the same failure
-    mode bad_orientation/root_height_below_minimum had in the other
-    termination.py. No narrowed/partial version is kept per your
-    confirmation that no body part is illegal to touch ground during
-    recovery.
-  - out_of_terrain_bounds: unchanged. Pure xy-position-vs-terrain-footprint
-    geometry check, no coupling to gait or velocity commands.
-  - terrain_edge_reached: DROPPED for standup. This is a "successful
-    traversal" signal (displacement from spawn exceeding sub-terrain size,
-    time_out=True, not penalized) -- the termination-side counterpart to
-    terrain_levels_vel's distance-traveled curriculum metric. Standup has
-    no "walk to the edge of the terrain" goal, so there's no analogous
-    success condition to detect this way; "success" for standup is height +
-    uprightness, not displacement, and is better expressed via reward
-    (standup_progress) and the terrain curriculum's own success check
-    (terrain_levels_standup), not a termination.
+    Combines two checks: base height below min_height (the robot has
+    collapsed), and uprightness below min_uprightness (the robot has tilted
+    past the allowed range). Either condition alone terminates. Using both
+    avoids a pathological middle ground where the robot is low but
+    technically still upright (e.g. deep squat) or upright but very low
+    (crouching all the way down). Tune thresholds to your robot; for the
+    G1 start with min_height=0.5 and min_uprightness=0.5 (~60 degrees of
+    allowed tilt -- generous enough to survive hard pushes without
+    triggering spurious terminations during normal balance corrections).
 
-What replaces the removed failure/success signals:
+  - stuck_no_progress: REMOVED. That term existed specifically for recovery
+    episodes where the robot could stall on the ground for 17-19 seconds
+    doing nothing useful. In stay-stand the robot starts upright and any
+    prolonged ground contact terminates via fell_over instead.
 
-  - catastrophic_state: NEW. Sanity-only check (height far below ground or
-    far above plausible standing height -- sim explosion/clipping), since
-    standup necessarily starts and spends time in states illegal_contact/
-    bad_orientation would have flagged as failures. Does not check contact
-    or orientation at all.
-  - stuck_no_progress: NEW. Ends an episode early if height hasn't improved
-    for a configured duration, so a stalled recovery attempt doesn't burn
-    the full episode length doing nothing -- locomotion's termination set
-    never needed an analog since there's no single-episode goal to stall
-    on while walking.
+  - catastrophic_state: KEPT. Still a useful sanity net for sim
+    explosions/clipping, independent of the fell_over logic.
 
-nan_detection: kept from the earlier (different-source) version of this
-file as a numerical safety net. It was not present in either termination.py
-you've shown me -- if it doesn't actually exist in your codebase, drop the
-import/registration for it; it's independent of everything else here.
+  - time_out, out_of_terrain_bounds, nan_detection: unchanged.
 """
 
 from __future__ import annotations
@@ -60,6 +37,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from mjlab.managers.scene_entity_config import SceneEntityCfg
+from mjlab.utils.lab_api.math import quat_apply_inverse
 
 if TYPE_CHECKING:
   from mjlab.entity import Entity
@@ -72,6 +50,44 @@ _DEFAULT_ASSET_CFG = SceneEntityCfg("robot")
 def time_out(env: ManagerBasedRlEnv) -> torch.Tensor:
   """Terminate when the episode length exceeds its maximum. Unchanged."""
   return env.episode_length_buf >= env.max_episode_length
+
+
+def fell_over(
+  env: ManagerBasedRlEnv,
+  min_height: float,
+  min_uprightness: float = 0.5,
+  asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+  """Terminate when the robot has fallen over. Primary failure signal for stay-stand.
+
+  Checks two conditions (either alone terminates):
+    - height < min_height: the robot's base has dropped below the collapse
+      threshold. For G1, min_height=0.5 means the pelvis is below ~63% of
+      standing height -- the robot has clearly fallen.
+    - uprightness < min_uprightness: the robot has tilted past the allowed
+      angle. uprightness = -projected_gravity_b[:, 2], so uprightness=1.0
+      is perfectly vertical and 0.0 is horizontal (lying on its side).
+      min_uprightness=0.5 corresponds to ~60 degrees of tilt -- generous
+      enough to survive hard pushes without spurious termination during
+      normal balance corrections, but tight enough to catch genuine falls
+      quickly and not waste episode time on a robot that is already on the
+      floor.
+
+  Tune min_height and min_uprightness together: if the robot ever reaches a
+  state where it is "low but technically upright" (e.g. deep squat where
+  height < min_height but uprightness > min_uprightness), tighten
+  min_height; if the robot is terminating during normal push recovery,
+  loosen min_uprightness.
+  """
+  asset: Entity = env.scene[asset_cfg.name]
+  height = asset.data.root_link_pos_w[:, 2]
+
+  gravity_w = asset.data.gravity_vec_w
+  root_quat_w = asset.data.root_link_quat_w
+  projected_gravity_b = quat_apply_inverse(root_quat_w, gravity_w)
+  uprightness = -projected_gravity_b[:, 2]
+
+  return (height < min_height) | (uprightness < min_uprightness)
 
 
 def catastrophic_state(
@@ -134,71 +150,6 @@ def out_of_terrain_bounds(
   limit_x = max(0.0, half_x - margin)
   limit_y = max(0.0, half_y - margin)
   return (root_xy_w[:, 0].abs() > limit_x) | (root_xy_w[:, 1].abs() > limit_y)
-
-
-class stuck_no_progress:
-  """Terminate early if the robot hasn't gained height for too long.
-
-  No analog in the velocity termination.py: locomotion termination is only
-  about ongoing failure (illegal contact, out of bounds, timed out) or
-  successful traversal (terrain_edge_reached), never "isn't making progress
-  toward a goal" within a single attempt, since steady walking has no
-  single-episode goal to stall on. Standup does have one (reach standing
-  height), so a stalled attempt -- e.g. wedged in a pose it can't escape, or
-  has stopped trying -- is worth ending early.
-
-  Tracks each env's best (highest) height seen so far and a per-env stall
-  timer that resets whenever a new best height is reached by at least
-  `min_improvement`. Terminates an env once its timer exceeds `patience_s`
-  without sufficient improvement.
-  """
-
-  def __init__(self, cfg: TerminationTermCfg, env: ManagerBasedRlEnv):
-    self._asset_cfg: SceneEntityCfg = cfg.params.get("asset_cfg", _DEFAULT_ASSET_CFG)
-    self._step_dt = env.step_dt
-    self._best_height = torch.full(
-      (env.num_envs,), float("-inf"), device=env.device
-    )
-    self._stall_time = torch.zeros(env.num_envs, device=env.device)
-
-  def __call__(
-    self,
-    env: ManagerBasedRlEnv,
-    patience_s: float,
-    min_improvement: float = 0.01,
-    min_standing_height: float = 0.0,
-    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
-  ) -> torch.Tensor:
-    asset: Entity = env.scene[asset_cfg.name]
-    height = asset.data.root_link_pos_w[:, 2]
-
-    improved = height > (self._best_height + min_improvement)
-    self._best_height = torch.where(improved, height, self._best_height)
-    self._stall_time = torch.where(
-      improved,
-      torch.zeros_like(self._stall_time),
-      self._stall_time + self._step_dt,
-    )
-
-    stuck = self._stall_time > patience_s
-    # Don't terminate an env that is *currently* at or above standing height.
-    # Robots that are standing (even if they've been stationary for a while,
-    # e.g. holding the standing pose) must never be cut off. Only terminate
-    # robots that are *currently below* standing height and haven't improved
-    # for `patience_s` seconds -- those are genuinely stuck on the ground.
-    #
-    # The previous `ever_standing` gate (`_best_height >= min_standing_height`)
-    # was wrong: it becomes True at step 1 for any robot that spawns from
-    # HOME_KEYFRAME (height 0.783m > 0.65m), so stuck & ~ever_standing was
-    # always False. Episodes ran to full time_out with the robot lying on the
-    # ground for 17-19 s after being pushed, generating long stretches of
-    # near-zero reward that destabilised the value function.
-    currently_standing = height >= min_standing_height
-    return stuck & ~currently_standing
-
-  def reset(self, env_ids: torch.Tensor) -> None:
-    self._best_height[env_ids] = float("-inf")
-    self._stall_time[env_ids] = 0.0
 
 
 def nan_detection(env: ManagerBasedRlEnv) -> torch.Tensor:

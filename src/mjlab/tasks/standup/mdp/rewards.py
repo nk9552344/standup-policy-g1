@@ -1,4 +1,40 @@
-# DONE
+"""Reward functions for the stay-stand (balance) policy.
+
+Forked from the standup recovery rewards.py. Key differences from the
+recovery version:
+
+  - standup_progress REMOVED. That function only existed to give dense
+    gradient during the get-up motion (height + uprightness from any fallen
+    state). Stay-stand always starts upright, so there is no get-up arc to
+    shape and the function is meaningless.
+
+  - _is_standing gate REMOVED from hold_still and variable_posture. In
+    recovery, these rewards returned zero while the robot was on the ground
+    so the get-up motion wasn't penalized as "error". In stay-stand the
+    robot is always at standing height (or the episode terminates via
+    fell_over), so the gate is either vacuously true or actively harmful
+    (it would suppress reward during the brief tilt after a push, exactly
+    when the policy most needs a correction signal). Both terms now fire
+    unconditionally every step.
+
+  - variable_posture simplified to a single std tensor. The two-band
+    (std_recovering / std_standing) design existed because recovery needed
+    loose tolerance during ground-contact phases and tight tolerance once
+    upright. With the gate gone there is only one operating regime, so
+    __init__ and __call__ are simplified to a single std_values param.
+    Config entries that used to pass std_recovering/std_standing now pass
+    std_values (a single joint-name-pattern -> float dict).
+
+  - body_angular_velocity_penalty and angular_momentum_penalty are now
+    active (non-zero weights in env_cfgs.py). In recovery they were
+    disabled because the tumbling/flailing phase produced angular velocities
+    that made these penalties enormous and destabilised the value function.
+    In stay-stand there is no tumbling phase, so the penalties are safe to
+    enable. HOWEVER: both now use a bounded exp kernel
+    (body_angular_velocity_penalty_bounded, angular_momentum_penalty_bounded)
+    rather than raw squared magnitude, to prevent the same value-function
+    divergence if the policy is ever pushed hard.
+"""
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
@@ -24,104 +60,32 @@ if TYPE_CHECKING:
 _DEFAULT_ASSET_CFG = SceneEntityCfg("robot")
 
 
-def _is_standing(
-  env: ManagerBasedRlEnv,
-  asset_cfg: SceneEntityCfg,
-  min_height: float,
-  min_uprightness: float,
-) -> torch.Tensor:
-  """Shared 'has the robot finished standing up' gate.
-
-  Combines base height and uprightness (projected-gravity z-component) so
-  that downstream terms which only make sense once standing -- velocity
-  hold-still, tight posture tolerance -- don't fire during the standup
-  motion itself and fight the recovery behavior.
-
-  uprightness is cos(tilt from vertical): 1.0 means perfectly upright,
-  -1.0 means upside down. Using gravity projection (not just quat) keeps
-  this consistent with the `upright` reward below, rather than introducing
-  a second way of measuring tilt.
-  """
-  asset: Entity = env.scene[asset_cfg.name]
-  height = asset.data.root_link_pos_w[:, 2]
-
-  gravity_w = asset.data.gravity_vec_w  # [3], points down, unit norm
-  root_quat_w = asset.data.root_link_quat_w
-  projected_gravity_b = quat_apply_inverse(root_quat_w, gravity_w)  # [B, 3]
-  # gravity_vec_w points down (e.g. [0, 0, -1]); when upright, the body-frame
-  # z-axis is anti-parallel to gravity, so -projected_gravity_b[:, 2] -> 1.0.
-  uprightness = -projected_gravity_b[:, 2]
-
-  return (height > min_height) & (uprightness > min_uprightness)
-
-
-def standup_progress(
-  env: ManagerBasedRlEnv,
-  target_height: float,
-  height_weight: float = 1.0,
-  uprightness_weight: float = 1.0,
-  asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
-) -> torch.Tensor:
-  """Dense shaping reward toward standing, from any starting state.
-
-  Locomotion's reward.py has nothing playing this role: its terms only
-  reward good behavior once already walking. Standup additionally needs a
-  signal that's informative *during* the recovery motion -- whether starting
-  from lying down, mid-fall after a push, or mid-tumble after a run stopped
-  abruptly -- so there is gradient to climb well before the robot is
-  upright.
-
-  Returns a value in roughly [-uprightness_weight, height_weight +
-  uprightness_weight]: height progress is clamped to [0, 1] (no bonus for
-  overshooting target_height), uprightness ranges [-1, 1] (penalizes being
-  upside down, rewards being upright) so the two combine into one dense
-  per-step reward.
-  """
-  asset: Entity = env.scene[asset_cfg.name]
-  height = asset.data.root_link_pos_w[:, 2]
-  height_progress = torch.clamp(height / target_height, min=0.0, max=1.0)
-
-  gravity_w = asset.data.gravity_vec_w
-  root_quat_w = asset.data.root_link_quat_w
-  projected_gravity_b = quat_apply_inverse(root_quat_w, gravity_w)
-  uprightness = -projected_gravity_b[:, 2]
-
-  env.extras["log"]["Metrics/standup_height_progress_mean"] = torch.mean(
-    height_progress
-  )
-  env.extras["log"]["Metrics/standup_uprightness_mean"] = torch.mean(uprightness)
-
-  return height_weight * height_progress + uprightness_weight * uprightness
-
-
 def hold_still(
   env: ManagerBasedRlEnv,
   std: float,
-  min_standing_height: float,
-  min_standing_uprightness: float = 0.8,
   asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
-  """Reward zero base linear+angular velocity, only once standing.
+  """Reward zero base linear + angular velocity. Fires unconditionally.
 
-  Replaces track_linear_velocity/track_angular_velocity's role of "track the
-  commanded velocity". Standup has no velocity command -- the implicit
-  target is always zero -- so this combines both into one term and gates
-  the whole reward to 0 while still recovering, rather than gating an error
-  term, so the policy gets no signal at all (positive or negative) about
-  velocity until it's actually standing. Before that gate, the necessary
-  motion of getting up would otherwise be penalized as "error".
+  In the recovery policy this was gated by _is_standing so that the
+  necessary motion of getting up wasn't penalized as velocity error. In
+  stay-stand the robot is always upright (a fall terminates the episode),
+  so no gate is needed -- any non-zero velocity is genuine error and should
+  be penalized immediately. Removing the gate also means the policy gets a
+  correction signal during the brief tilt after a push, which is exactly
+  when it most needs one.
+
+  Both linear and angular velocity are penalized together (sum of squared
+  components), bounded via an exp kernel so the penalty never blows up
+  the value function.
   """
   asset: Entity = env.scene[asset_cfg.name]
-  standing = _is_standing(
-    env, asset_cfg, min_standing_height, min_standing_uprightness
-  )
 
   lin_error = torch.sum(torch.square(asset.data.root_link_lin_vel_b), dim=1)
   ang_error = torch.sum(torch.square(asset.data.root_link_ang_vel_b), dim=1)
   vel_error = lin_error + ang_error
 
-  reward = torch.exp(-vel_error / std**2)
-  return torch.where(standing, reward, torch.zeros_like(reward))
+  return torch.exp(-vel_error / std**2)
 
 
 class upright:
@@ -244,57 +208,79 @@ def self_collision_cost(
 
 def body_angular_velocity_penalty(
   env: ManagerBasedRlEnv,
+  std: float,
   asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
-  """Penalize excessive body angular velocities. Unchanged -- task-agnostic.
+  """Penalize excessive body angular velocities with a bounded exp kernel.
 
-  Note: for standup specifically, consider whether you want this active
-  during the early tumble/recovery phase, where some roll/pitch angular
-  velocity is an unavoidable part of e.g. rolling from prone to a crouch.
-  If it fights the recovery motion in practice, gate it with `_is_standing`
-  the same way `hold_still` is gated.
+  In the recovery policy this used raw squared magnitude and was disabled
+  (weight=0) because tumbling produced angular velocities of ~50-100 rad/s,
+  making the penalty -250 to -1000 per step and destabilising the value
+  function. In stay-stand there is no tumbling phase, so we can re-enable
+  it. However, we still use exp(-x²/std²) rather than raw squared magnitude:
+    - Bounded in [0, 1] -- the penalty can never blow up the value function
+      no matter how chaotic the state after a hard push.
+    - Still provides a strong gradient near zero (small angular velocities
+      near std matter just as much as large ones).
+
+  Only roll and pitch (xy) are penalized; yaw rotation is a separate concern
+  (the robot should be able to yaw to settle, and yaw angular velocity alone
+  doesn't indicate instability the same way pitch/roll does).
+
+  std: characteristic angular velocity (rad/s) at which the reward falls to
+  exp(-1) ≈ 0.37. A value of ~1.0 rad/s is a reasonable starting point --
+  tighter than walking gait but loose enough not to penalize normal balance
+  corrections.
   """
   asset: Entity = env.scene[asset_cfg.name]
   ang_vel = asset.data.body_link_ang_vel_w[:, asset_cfg.body_ids, :]
   ang_vel = ang_vel.squeeze(1)
-  ang_vel_xy = ang_vel[:, :2]  # Don't penalize z-angular velocity.
-  return torch.sum(torch.square(ang_vel_xy), dim=1)
+  ang_vel_xy = ang_vel[:, :2]  # Roll + pitch only.
+  xy_sq = torch.sum(torch.square(ang_vel_xy), dim=1)
+  return torch.exp(-xy_sq / std**2)
 
 
 def angular_momentum_penalty(
   env: ManagerBasedRlEnv,
   sensor_name: str,
+  std: float,
 ) -> torch.Tensor:
-  """Penalize whole-body angular momentum. Unchanged -- task-agnostic.
+  """Penalize whole-body angular momentum with a bounded exp kernel.
 
-  For locomotion this encourages natural arm swing; for standup it
-  discourages flailing/wild limb motion during recovery, which is equally
-  desirable.
+  Same reasoning as body_angular_velocity_penalty: was disabled in recovery
+  because tumbling/flailing produced magnitudes that blew up the value
+  function. Now re-enabled with exp(-|L|²/std²) so the penalty is bounded
+  in [0, 1] regardless of what the policy does after a hard push.
+
+  std: characteristic angular momentum magnitude at which reward falls to
+  exp(-1) ≈ 0.37. Units depend on your robot's inertia tensor; start with
+  std ~1.0 and adjust based on typical standing angular momentum logged
+  during early training.
   """
   angmom_sensor: BuiltinSensor = env.scene[sensor_name]
   angmom = angmom_sensor.data
   angmom_magnitude_sq = torch.sum(torch.square(angmom), dim=-1)
   angmom_magnitude = torch.sqrt(angmom_magnitude_sq)
   env.extras["log"]["Metrics/angular_momentum_mean"] = torch.mean(angmom_magnitude)
-  return angmom_magnitude_sq
+  return torch.exp(-angmom_magnitude_sq / std**2)
 
 
 class variable_posture:
-  """Penalize deviation from default pose with recovery-phase-dependent tolerance.
+  """Penalize deviation from default pose.
 
-  Reframed from locomotion's command-speed-banded version (standing/walking/
-  running, driven by commanded velocity) since standup has no velocity
-  command. Instead bands are driven by `_is_standing`: tight tolerance once
-  standing, loose tolerance while still recovering (lying/tumbling/getting
-  up), so the policy isn't punished for the large joint excursions needed to
-  push up from the ground, push off after a fall, or recover from a push
-  mid-standup.
+  Simplified from the recovery version, which had two std bands
+  (std_recovering / std_standing) gated by _is_standing. That design
+  existed because recovery needed loose tolerance during ground-contact
+  phases (large joint excursions while pushing off the floor) and tight
+  tolerance once upright. In stay-stand there is only one operating
+  regime -- the robot is always upright -- so the gate and the second band
+  are both removed. Config passes a single std_values dict instead of two.
 
   Uses per-joint standard deviations to control how much each joint can
-  deviate from default pose. Smaller std = stricter, larger std = more
-  forgiving. Reward is: exp(-mean(error² / std²)).
+  deviate from default pose. Smaller std = stricter gradient, larger std =
+  more forgiving. Reward is: exp(-mean(error² / std²)).
 
-  Map joint name patterns to std values, e.g. {".*knee.*": 0.35}.
+  Map joint name patterns to std values, e.g. {".*knee.*": 0.25}.
   """
 
   def __init__(self, cfg: RewardTermCfg, env: ManagerBasedRlEnv):
@@ -305,44 +291,23 @@ class variable_posture:
 
     _, joint_names = asset.find_joints(cfg.params["asset_cfg"].joint_names)
 
-    _, _, std_recovering = resolve_matching_names_values(
-      data=cfg.params["std_recovering"],
+    _, _, std_values = resolve_matching_names_values(
+      data=cfg.params["std_values"],
       list_of_strings=joint_names,
     )
-    self.std_recovering = torch.tensor(
-      std_recovering, device=env.device, dtype=torch.float32
-    )
-
-    _, _, std_standing = resolve_matching_names_values(
-      data=cfg.params["std_standing"],
-      list_of_strings=joint_names,
-    )
-    self.std_standing = torch.tensor(
-      std_standing, device=env.device, dtype=torch.float32
-    )
+    self.std = torch.tensor(std_values, device=env.device, dtype=torch.float32)
 
   def __call__(
     self,
     env: ManagerBasedRlEnv,
-    std_recovering,
-    std_standing,
+    std_values: dict,
     asset_cfg: SceneEntityCfg,
-    min_standing_height: float,
-    min_standing_uprightness: float = 0.8,
   ) -> torch.Tensor:
-    del std_recovering, std_standing  # Unused; consumed in __init__.
+    del std_values  # Consumed in __init__; unused at call time.
 
     asset: Entity = env.scene[asset_cfg.name]
-    standing = _is_standing(
-      env, asset_cfg, min_standing_height, min_standing_uprightness
-    )
-
-    std = torch.where(
-      standing.unsqueeze(1), self.std_standing, self.std_recovering
-    )
-
     current_joint_pos = asset.data.joint_pos[:, asset_cfg.joint_ids]
     desired_joint_pos = self.default_joint_pos[:, asset_cfg.joint_ids]
     error_squared = torch.square(current_joint_pos - desired_joint_pos)
 
-    return torch.exp(-torch.mean(error_squared / (std**2), dim=1))
+    return torch.exp(-torch.mean(error_squared / (self.std**2), dim=1))

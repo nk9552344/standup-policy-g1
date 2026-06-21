@@ -60,7 +60,13 @@ def unitree_g1_ppo_runner_cfg() -> RslRlOnPolicyRunnerCfg:
         # ~0.1 rad per joint exploration noise -- enough to discover the
         # standup gradient without making the robot vibrate so much it
         # can't earn the still-standing rewards.
-        "init_std": 0.1,
+        # init_std=0.3 gives wider exploration (~0.3 rad per joint at init)
+        # to help the policy discover the standing attractor from random
+        # starts without relying on std growth. learn_std=False keeps std
+        # fixed throughout training -- see the long comment above for why
+        # learn_std=True causes the exact std-growth feedback loop we are
+        # trying to avoid.
+        "init_std": 0.3,
         "std_type": "scalar",
         "learn_std": False,
       },
@@ -95,7 +101,7 @@ def unitree_g1_ppo_runner_cfg() -> RslRlOnPolicyRunnerCfg:
       desired_kl=0.01,  # Unused under schedule="fixed" but kept for clarity.
       max_grad_norm=1.0,
     ),
-    experiment_name="g1_standup",
+    experiment_name="g1_staystand",
     save_interval=50,
     num_steps_per_env=24,
     max_iterations=30_000,

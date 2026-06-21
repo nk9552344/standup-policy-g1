@@ -59,17 +59,8 @@ from mjlab.sensor import (
 from mjlab.tasks.standup.mdp.standup_command import StandStillCommandCfg
 from mjlab.tasks.standup.standup_env_cfg import make_standup_env_cfg
 
-# G1 pelvis standing height from g1.xml:
-#   <body name="pelvis" pos="0 0 0.793" ...>
-# standup_progress.target_height must be the FULL standing height so that
-# height_progress has gradient all the way to a complete upright stand.
-# Using MIN_STANDING_HEIGHT (0.5) saturates height_progress at a crouch and
-# removes the signal that drives the robot past 50 cm.
-_G1_PELVIS_STANDING_HEIGHT: float = 0.793
 # Minimum height to be considered "standing" (~82 % of full standing height).
-# Used to gate hold_still / variable_posture rewards and the terrain
-# curriculum success check so they only fire once the robot is actually up,
-# not just crouching.
+# Used by the terrain curriculum success check and the fell_over termination.
 _G1_MIN_STANDING_HEIGHT: float = 0.65
 
 
@@ -185,48 +176,12 @@ def unitree_g1_rough_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   cfg.events["foot_friction"].params["asset_cfg"].geom_names = geom_names
   cfg.events["base_com"].params["asset_cfg"].body_names = ("torso_link",)
 
-  # Rationale for std values:
-  # - Knees/hip_pitch get the loosest std to allow natural leg bending during
-  #   the get-up motion.
-  # - Hip roll/yaw stay tighter to prevent excessive lateral sway once
-  #   standing and keep the recovered pose stable.
-  # - Ankle roll is very tight for balance; ankle pitch looser for ground
-  #   contact/push-off during recovery.
-  # - Waist roll/pitch stay tight to keep the torso upright and stable once
-  #   standing.
-  # - Shoulders/elbows get moderate freedom -- arms are often used to push
-  #   off the ground or counterbalance during standup.
-  # - Wrists are loose (0.3) since they don't affect balance much.
-  # std_recovering values are seeded from the original walking std values
-  # (~the same magnitude of motion freedom needed for a get-up motion as for
-  # a walking stride); the original running std values are dropped, since
-  # standup has no equivalent "running" regime.
-  # std_standing was 0.15 (uniform across all joints) -- that's an extremely
-  # tight tolerance: exp(-error^2 / 0.15^2) drops to ~0.01 by ~0.3 rad
-  # deviation, so any noise in early-training actions instantly zeros out
-  # this reward and gives no learning gradient. 0.25 is loose enough for
-  # the policy to receive a useful per-step signal while still rewarding
-  # the converged policy for tight default-pose tracking.
-  cfg.rewards["pose"].params["std_standing"] = {".*": 0.25}
-  cfg.rewards["pose"].params["std_recovering"] = {
-    # Lower body.
-    r".*hip_pitch.*": 0.3,
-    r".*hip_roll.*": 0.15,
-    r".*hip_yaw.*": 0.15,
-    r".*knee.*": 0.35,
-    r".*ankle_pitch.*": 0.25,
-    r".*ankle_roll.*": 0.1,
-    # Waist.
-    r".*waist_yaw.*": 0.2,
-    r".*waist_roll.*": 0.08,
-    r".*waist_pitch.*": 0.1,
-    # Arms.
-    r".*shoulder_pitch.*": 0.15,
-    r".*shoulder_roll.*": 0.15,
-    r".*shoulder_yaw.*": 0.1,
-    r".*elbow.*": 0.15,
-    r".*wrist.*": 0.3,
-  }
+  # Single std band: stay-stand has only one operating regime (always
+  # upright), so the two-band std_recovering/std_standing design collapses
+  # to a single std_values dict. 0.25 is loose enough for the policy to
+  # receive a useful per-step signal while still rewarding tight default-pose
+  # tracking once converged.
+  cfg.rewards["pose"].params["std_values"] = {".*": 0.25}
 
   cfg.rewards["upright"].params["asset_cfg"].body_names = ("torso_link",)
   cfg.rewards["body_ang_vel"].params["asset_cfg"].body_names = ("torso_link",)
@@ -242,67 +197,39 @@ def unitree_g1_rough_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   # the robot has toppled.
   cfg.rewards["upright"].params["std"] = 0.05 ** 0.5
 
-  # REWARD REBALANCING. The previous setup had standup_progress (weight
-  # 5.0, max ~15/step) dominating pose (weight 1.0, max 1/step) and
-  # upright (weight 2.0, max 2/step) by ~15:1. Standup_progress only
-  # requires "vaguely upright at decent height" to fire, so the policy
-  # converged to a non-default upright attractor where pose reward stayed
-  # pinned at ~0.01 for the entire run. Episode_Reward/pose was flat at
-  # 0.01 for 1000+ iterations, which is the signature of a stable local
-  # optimum that doesn't include the default pose.
-  #
-  # New balance (per-step weighted max, in default-pose standing state):
-  #   pose:             10.0  (was 1.0)  -- dominant attractor toward
-  #                                          *default* pose specifically
-  #   upright:           5.0  (was 2.0)  -- bounded vertical attractor
-  #   hold_still:        2.0  (unchanged) -- low-velocity, gated
-  #   standup_progress:  2.0  (was 5.0)  -- shaping signal, no longer
-  #                                          drowns out the others
-  # Total max per step ~19, vs ~10/step achievable from "any upright
-  # non-default pose", so the default-pose attractor wins. Pose at weight
-  # 10 with std_standing=0.25 still has exp(-error^2/0.25^2) bounded in
-  # [0, 10], so no risk of value-function divergence.
+  # Reward balance (per-step weighted max, in default-pose standing state):
+  #   pose:       10.0 -- dominant attractor toward *default* pose
+  #   upright:     5.0 -- bounded vertical attractor
+  #   hold_still:  2.0 -- low-velocity penalty
+  # Total max per step ~17. pose with std=0.25 is bounded in [0, 10].
   cfg.rewards["pose"].weight = 10.0
   cfg.rewards["upright"].weight = 5.0
-  cfg.rewards["standup_progress"].weight = 2.0
 
-  # LOWER THE STANDING-GATE TOLERANCE. min_standing_uprightness=0.8 means
-  # the robot must be tilted < cos^-1(0.8) ~ 37 degrees from vertical for
-  # pose to use the tight std_standing band and for hold_still to fire at
-  # all. Early in training the robot wobbles past this threshold easily,
-  # causing pose to switch to the loose std_recovering band (weak
-  # gradient) and hold_still to drop to 0 (no signal at all). Lowering to
-  # 0.5 (~60 degrees of tilt allowed) keeps the tight, informative reward
-  # signal active through the wobbling phase so the policy has a clear
-  # gradient back toward upright + default pose.
-  cfg.rewards["pose"].params["min_standing_uprightness"] = 0.5
-  cfg.rewards["hold_still"].params["min_standing_uprightness"] = 0.5
+  # body_ang_vel and angular_momentum now use bounded exp(-x²/std²) kernels
+  # (see rewards.py), but they are stability-shaping signals for a policy
+  # that already stands. Enable them once the robot can stand reliably;
+  # leaving them active from iteration 0 adds value-function noise that
+  # fights bootstrapping. Same for action_rate_l2.
+  cfg.rewards["body_ang_vel"].params["std"] = 1.0
+  cfg.rewards["body_ang_vel"].weight = 0.0  # Re-enable (e.g. -0.05) once robot can stand.
+  cfg.rewards["angular_momentum"].params["std"] = 1.0
+  cfg.rewards["angular_momentum"].weight = 0.0  # Re-enable (e.g. -0.01) once robot can stand.
+  cfg.rewards["action_rate_l2"].weight = 0.0  # Re-enable (e.g. -0.01) once robot can stand.
 
-  # Both body_ang_vel and angular_momentum use unbounded squared-magnitude
-  # kernels (sum(square(ang_vel)) and sum(square(angmom))). When the
-  # policy collapses into chaotic flailing -- which it did at iter ~700 in
-  # the last run -- angular velocities of ~50-100 rad/s produce per-step
-  # penalties of -250 to -1000, which over a 1000-step episode sums to
-  # -250k to -1M reward. The value function cannot fit a target that
-  # large, diverges to ~1e11, and the resulting catastrophic policy
-  # gradient destroys the policy. Disable both for now; they're penalty
-  # shaping for already-stable behavior, not signals that help discover
-  # the standup behavior. Re-enable with bounded kernels (e.g.
-  # exp(-x^2/std^2)) once the policy can reliably stand.
-  cfg.rewards["body_ang_vel"].weight = 0.0
-  cfg.rewards["angular_momentum"].weight = 0.0
-
-  # G1 standing height overrides -- these must all use the same definition
-  # of "standing" so hold_still, pose, curriculum, and termination are
-  # consistent. target_height drives the gradient all the way to full stand.
-  cfg.rewards["standup_progress"].params["target_height"] = _G1_PELVIS_STANDING_HEIGHT
-  cfg.rewards["hold_still"].params["min_standing_height"] = _G1_MIN_STANDING_HEIGHT
-  cfg.rewards["pose"].params["min_standing_height"] = _G1_MIN_STANDING_HEIGHT
+  # G1 standing height overrides -- terrain curriculum and fell_over
+  # termination both use the same "is standing" threshold.
   cfg.curriculum["terrain_levels"].params["min_standing_height"] = _G1_MIN_STANDING_HEIGHT
-  # Keep terrain frozen at level 0 until Stage 1 of fall_difficulty so the
-  # robot masters balance on easy terrain before facing rough terrain.
-  cfg.curriculum["terrain_levels"].params["min_step_counter"] = 3000 * 24
-  cfg.terminations["stuck_no_progress"].params["min_standing_height"] = _G1_MIN_STANDING_HEIGHT
+
+  # fell_over thresholds: these must NOT be close to the HOME_KEYFRAME height
+  # (~0.72-0.75 m with bent knees). min_height=0.65 is only 7-10 cm below
+  # standing height -- random policy actions perturb the pelvis enough to
+  # cross that threshold in a handful of steps, collapsing every episode.
+  # 0.45 m (57% of standing height) is clearly fallen, not just crouching.
+  # min_uprightness=0.2 allows up to ~80 degrees of tilt before terminating;
+  # the robot needs this room to discover the standing attractor before it
+  # learns to correct itself. Tighten both once the robot reliably stands.
+  cfg.terminations["fell_over"].params["min_height"] = 0.45
+  cfg.terminations["fell_over"].params["min_uprightness"] = 0.2
 
   # Wire the generic self_collision placeholder (defined in
   # standup_env_cfg.py) to this robot's actual sensor name and a stronger

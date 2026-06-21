@@ -244,11 +244,8 @@ def make_standup_env_cfg() -> ManagerBasedRlEnvCfg:
       func=mdp.reset_fallen_state,
       mode="reset",
       params={
-        # Curriculum-controlled via fall_difficulty below; this is the
-        # starting (easiest) stage -- robot spawns fully upright so the
-        # policy can first learn balance and receive positive rewards before
-        # being asked to recover from falls. fall_difficulty progresses this
-        # through near_upright -> side -> any over training.
+        # Always spawn upright. The robot starts standing and a fall
+        # terminates the episode, so no orientation curriculum is needed.
         "orientation_mode": "standing",
         "height_range": (0.0, 0.0),
         "velocity_range": {},
@@ -268,13 +265,13 @@ def make_standup_env_cfg() -> ManagerBasedRlEnvCfg:
       mode="interval",
       interval_range_s=(8.0, 15.0),
       params={
-        # Stage 0: no push at all. A ±0.5 m/s push at iteration 0 knocks
-        # the robot over before it has learned any balance, then it lies on
-        # the ground for the rest of the episode collecting "pose" reward
-        # in std_recovering mode. The policy learns to be a limp ragdoll
-        # instead of learning to stand. fall_difficulty escalates this
-        # velocity in Stage 1+ once the robot can maintain balance.
-        "velocity_range": {},
+        # Fixed moderate push from iteration 0. The robot starts standing,
+        # so push-recovery is a first-class skill from the start.
+        "velocity_range": {
+          "x": (-0.3, 0.3),
+          "y": (-0.3, 0.3),
+          "z": (-0.2, 0.2),
+        },
       },
     ),
     "foot_friction": EventTermCfg(
@@ -315,27 +312,11 @@ def make_standup_env_cfg() -> ManagerBasedRlEnvCfg:
   ##
 
   rewards = {
-    "standup_progress": RewardTermCfg(
-      func=mdp.standup_progress,
-      weight=5.0,
-      params={
-        # Must be set per-robot to the robot's actual full standing height
-        # (e.g. pelvis z from the MJCF), NOT to MIN_STANDING_HEIGHT. Using
-        # MIN_STANDING_HEIGHT here saturates height_progress at the crouch
-        # threshold and removes all gradient toward a full upright stand.
-        # Override in your robot-specific cfg.
-        "target_height": MIN_STANDING_HEIGHT,
-        "height_weight": 2.0,
-        "uprightness_weight": 1.0,
-      },
-    ),
     "hold_still": RewardTermCfg(
       func=mdp.hold_still,
       weight=2.0,
       params={
         "std": math.sqrt(0.25),
-        "min_standing_height": MIN_STANDING_HEIGHT,
-        "min_standing_uprightness": 0.8,
       },
     ),
     "upright": RewardTermCfg(
@@ -351,23 +332,24 @@ def make_standup_env_cfg() -> ManagerBasedRlEnvCfg:
       weight=1.0,
       params={
         "asset_cfg": SceneEntityCfg("robot", joint_names=(".*",)),
-        "min_standing_height": MIN_STANDING_HEIGHT,
-        "min_standing_uprightness": 0.8,
-        "std_recovering": {},  # Set per-robot.
-        "std_standing": {},  # Set per-robot.
+        "std_values": {},  # Set per-robot.
       },
     ),
     "body_ang_vel": RewardTermCfg(
       func=mdp.body_angular_velocity_penalty,
-      weight=0.0,  # Override per-robot. Consider gating to standing-only
-      # if it fights the recovery/tumble motion in practice -- see note in
-      # standup_reward.py.
-      params={"asset_cfg": SceneEntityCfg("robot", body_names=())},  # Set per-robot.
+      weight=0.0,  # Override per-robot.
+      params={
+        "std": 1.0,  # Override per-robot.
+        "asset_cfg": SceneEntityCfg("robot", body_names=()),  # Set per-robot.
+      },
     ),
     "angular_momentum": RewardTermCfg(
       func=mdp.angular_momentum_penalty,
-      weight=0.0,  # Override per-robot
-      params={"sensor_name": "robot/root_angmom"},
+      weight=0.0,  # Override per-robot.
+      params={
+        "sensor_name": "robot/root_angmom",
+        "std": 1.0,  # Override per-robot.
+      },
     ),
     "dof_pos_limits": RewardTermCfg(func=mdp.joint_pos_limits, weight=-0.05),
     # action_rate_l2 is unbounded (||a_t - a_{t-1}||^2). When the policy
@@ -400,20 +382,11 @@ def make_standup_env_cfg() -> ManagerBasedRlEnvCfg:
         "max_height": 3.0,  # your robot's scale. See standup_termination.py.
       },
     ),
-    "stuck_no_progress": TerminationTermCfg(
-      func=mdp.stuck_no_progress,
+    "fell_over": TerminationTermCfg(
+      func=mdp.fell_over,
       params={
-        # Must be < (episode_length_s - min(push_interval_s)) to actually
-        # fire within an episode after a push knocks the robot over.
-        # With episode_length_s=20 and interval_range_s=(8,15), a push
-        # at t=8s + patience_s=8s = termination at t=16s < 20s. ✓
-        # patience_s=15 was too long: push at t=10s + 15s = 25s > 20s,
-        # so stuck_no_progress never fired and episodes always timed out.
-        "patience_s": 8.0,
-        "min_improvement": 0.01,
-        # Gate: don't terminate an env that is currently at standing height.
-        # Set per-robot to match min_standing_height used elsewhere.
-        "min_standing_height": MIN_STANDING_HEIGHT,
+        "min_height": MIN_STANDING_HEIGHT,
+        "min_uprightness": 0.5,
       },
     ),
     "out_of_terrain_bounds": TerminationTermCfg(
@@ -421,9 +394,6 @@ def make_standup_env_cfg() -> ManagerBasedRlEnvCfg:
       time_out=True,
     ),
     "nan_detection": TerminationTermCfg(func=mdp.nan_detection),
-    # fell_over (bad_orientation) removed: would terminate every episode at
-    # t=0, since starting badly oriented (lying down) is the entire premise
-    # of this task. Replaced by catastrophic_state above.
   }
 
   ##
@@ -436,86 +406,6 @@ def make_standup_env_cfg() -> ManagerBasedRlEnvCfg:
       params={
         "min_standing_height": MIN_STANDING_HEIGHT,
         "min_standing_uprightness": 0.8,
-        # Don't advance terrain until Stage 1 of fall_difficulty (step
-        # 3000*24). This ensures the robot first masters balance on easy
-        # terrain before being exposed to rough terrain. Without this gate,
-        # any robot successfully standing in Stage 0 immediately advances to
-        # harder terrain, causing the boom-bust oscillation that crashed
-        # pose/upright rewards at iter ~400 in earlier runs.
-        "min_step_counter": 3000 * 24,
-      },
-    ),
-    "fall_difficulty": CurriculumTermCfg(
-      func=mdp.fall_difficulty,
-      params={
-        "reset_event_name": "reset_base",
-        "push_event_name": "push_robot",
-        "fall_stages": [
-          {
-            # Stage 0: default standing pose. Robot learns balance and
-            # collects strong positive rewards (upright, hold_still, pose)
-            # before ever seeing a fallen start state. No push disturbance
-            # in this stage: full-strength pushes before balance is learned
-            # cause the robot to fall and lie on the ground for 10+ seconds
-            # per episode, learning to be a limp ragdoll instead of standing.
-            "step": 0,
-            "orientation_mode": "standing",
-            "velocity_range": {},
-            "push_force_range": None,
-            "push_torque_range": None,
-            "push_velocity_range": None,  # No push in Stage 0.
-          },
-          {
-            # Stage 1: small tilt (+-0.3 rad / ~17 deg). Robot must now
-            # recover from a slight imbalance -- close to the balance task
-            # it already learned, so the transition is smooth. Enable light
-            # pushes now that the robot can maintain balance.
-            "step": 3000 * 24,
-            "orientation_mode": "near_upright",
-            "velocity_range": {"x": (-0.5, 0.5), "y": (-0.5, 0.5)},
-            "push_force_range": None,
-            "push_torque_range": None,
-            "push_velocity_range": {
-              "x": (-0.3, 0.3),
-              "y": (-0.3, 0.3),
-              "z": (-0.2, 0.2),
-            },
-          },
-          {
-            # Stage 2: side falls. Roll randomized fully, pitch stays
-            # small. Robot must learn to roll back upright from its side.
-            # Full push velocity enabled.
-            "step": 10000 * 24,
-            "orientation_mode": "side",
-            "velocity_range": {"x": (-1.0, 1.0), "y": (-1.0, 1.0)},
-            "push_force_range": None,
-            "push_torque_range": None,
-            "push_velocity_range": {
-              "x": (-0.5, 0.5),
-              "y": (-0.5, 0.5),
-              "z": (-0.4, 0.4),
-              "roll": (-0.52, 0.52),
-              "pitch": (-0.52, 0.52),
-              "yaw": (-0.78, 0.78),
-            },
-          },
-          {
-            # Stage 3: arbitrary orientation (face-down, face-up, any).
-            # Full recovery from any fallen state.
-            "step": 20000 * 24,
-            "orientation_mode": "any",
-            "velocity_range": {
-              "x": (-2.0, 2.0),
-              "y": (-2.0, 2.0),
-              "roll": (-1.5, 1.5),
-              "pitch": (-1.5, 1.5),
-              "yaw": (-1.5, 1.5),
-            },
-            "push_force_range": None,
-            "push_torque_range": None,
-            "push_velocity_range": None,  # Keep Stage 2 push range.
-          },
-        ],
       },
     ),
   }

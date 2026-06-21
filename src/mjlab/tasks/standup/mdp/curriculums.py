@@ -1,44 +1,37 @@
-"""Useful methods for MDP curricula.
+"""Useful methods for MDP curricula for the stay-stand (balance) policy.
 
-Forked from the velocity locomotion curriculum.py. Both original terms were
-specific to "tracking a commanded velocity while walking" and needed a real
-rework, not just a rename, since standup has neither distance-to-walk nor a
-velocity range to widen:
+Forked from the standup recovery curriculums.py. One function kept, one
+removed:
 
-  - `terrain_levels_vel` progressed terrain difficulty based on distance
-    walked relative to terrain size and commanded speed. Standup doesn't
-    walk anywhere -- there's no analogous distance signal. Replaced by
-    `terrain_levels_standup`, which progresses based on whether the robot
-    successfully reached standing height in that episode instead.
-  - `commands_vel` widened `UniformVelocityCommandCfg.ranges` (lin_vel_x/y,
-    ang_vel_z) over training steps. Standup has no command ranges to widen
-    -- the command is always zero (see StandStillCommand). The actual
-    curriculum axis you want is fall/disturbance severity, which lives on
-    *event term* params (reset_fallen_state's orientation_mode, push
-    force/velocity ranges), not on a command term. Replaced by
-    `fall_difficulty`, which mutates event term params the same way
-    commands_vel mutated command term params, just via env.event_manager
-    instead of env.command_manager.
+  - `terrain_levels_standup` KEPT, with an updated success definition.
+    In recovery, "success" meant "the robot reached standing height from
+    a fallen start state". In stay-stand, "success" means "the robot was
+    still upright when the episode ended" -- i.e. it survived the full
+    episode (or was still standing at time_out) without triggering
+    fell_over. The height + uprightness gate is identical; only the
+    semantic meaning changes. The `min_step_counter` gate is also removed:
+    in recovery it held terrain at level 0 until Stage 1 of fall_difficulty
+    so the robot could first master easy terrain before facing rough terrain.
+    In stay-stand there is no fall_difficulty stage gating and the robot
+    starts standing from iteration 0, so the gate is unnecessary -- any
+    robot that survives an episode on terrain level 0 should immediately
+    advance.
 
-NOTE: `fall_difficulty` assumes `env.event_manager.get_term_cfg(name)`
-returns a mutable cfg with a `.params` dict, mirroring how the original used
-`env.command_manager.get_term(name)`. If your EventManager's actual API
-differs (different method name, immutable cfg, etc.), the lookup line is the
-only thing that needs to change -- the staging logic is unaffected.
+  - `fall_difficulty` REMOVED entirely. That function staged the severity
+    of fallen start states and push disturbances over training (standing ->
+    near_upright -> side -> any). Stay-stand has no fallen start states:
+    the reset always spawns from HOME_KEYFRAME (upright). Push disturbance
+    strength is set as a fixed param in env_cfgs.py rather than staged.
+    `FallStage` TypedDict also removed as it only served `fall_difficulty`.
 
-NOTE: `terrain_levels_standup` computes "did this env stand successfully"
-from current state at curriculum-call time, before any reset has been
-applied to env_ids for this step (matching the original's assumption that
-curriculum terms read pre-reset distance). If your manager actually invokes
-curriculum terms *after* state has already been reset, this signal will be
-wrong and you'd need to track success in a per-step buffer instead (e.g. set
-a flag in a termination or reward term the moment standing is achieved, and
-read that buffer here instead of recomputing from instantaneous state).
+NOTE: `terrain_levels_standup` reads pre-reset state at curriculum-call
+time, same as the recovery version. See the note in the recovery docstring
+if your manager calls curriculum terms after reset.
 """
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, TypedDict, cast
+from typing import TYPE_CHECKING
 
 import torch
 
@@ -79,34 +72,32 @@ def terrain_levels_standup(
   env_ids: torch.Tensor,
   min_standing_height: float,
   min_standing_uprightness: float = 0.8,
-  min_step_counter: int = 0,
   asset_cfg: SceneEntityCfg = _DEFAULT_SCENE_CFG,
 ) -> dict[str, torch.Tensor]:
-  """Progress/regress terrain difficulty based on standup success.
+  """Progress/regress terrain difficulty based on stay-stand success.
 
-  Replaces distance-walked progression with: did the robot reach a
-  standing pose (height + uprightness gate, same definition used in
-  reward/termination) by the time this episode ended. Envs that succeeded
-  move to harder terrain; envs that failed move to easier terrain.
+  Success definition: was the robot still upright (height + uprightness gate)
+  when this episode ended? In recovery, success meant "reached standing height
+  from a fallen start". In stay-stand, any episode that ends with the robot
+  still upright is a success (it survived without triggering fell_over);
+  any episode that ended via fell_over is a failure. The gate computation is
+  identical -- only the semantic interpretation changes.
 
-  ``min_step_counter`` gates all terrain advancement until the training has
-  reached that step count. Set it to match the fall_difficulty Stage 1
-  threshold so the robot masters flat/easy terrain before being exposed to
-  rough terrain. Without this gate, every robot that successfully stands
-  in Stage 0 immediately advances to harder terrain -- the curriculum then
-  oscillates between the robot succeeding on easy terrain and failing on
-  hard terrain, destabilising training.
+  Envs that were upright at episode end advance to harder terrain; envs that
+  had fallen move to easier terrain.
+
+  The `min_step_counter` gate present in the recovery version is removed.
+  That gate held terrain at level 0 until fall_difficulty Stage 1 unlocked
+  harder falls, so the robot could master easy terrain before facing rough
+  terrain while also dealing with arbitrary fallen starts. In stay-stand
+  there is no fall_difficulty and the robot starts upright from iteration 0,
+  so a robot that survives episode 1 on level 0 terrain should advance
+  immediately.
   """
   terrain = env.scene.terrain
   assert terrain is not None
   terrain_generator = terrain.cfg.terrain_generator
   assert terrain_generator is not None
-
-  # Don't advance terrain until the minimum step threshold is reached.
-  # All envs stay at their current level; only log terrain stats.
-  if env.common_step_counter < min_step_counter:
-    levels = terrain.terrain_levels.float()
-    return {"mean": torch.mean(levels), "max": torch.max(levels)}
 
   succeeded = _is_standing(
     env, env_ids, asset_cfg, min_standing_height, min_standing_uprightness
@@ -133,86 +124,3 @@ def terrain_levels_standup(
       if mask.any():
         result[name] = torch.mean(levels[mask])
   return result
-
-
-class FallStage(TypedDict):
-  step: int
-  orientation_mode: str | None
-  velocity_range: dict[str, tuple[float, float]] | None
-  push_force_range: tuple[float, float] | None
-  push_torque_range: tuple[float, float] | None
-  push_velocity_range: dict[str, tuple[float, float]] | None
-  """Velocity range for push_by_setting_velocity. Replaces the entire
-  velocity_range dict in the push event's params when not None. Use this
-  to enable/escalate push disturbances in later curriculum stages (Stage 0
-  should always be None so the robot learns balance before facing pushes)."""
-
-
-def fall_difficulty(
-  env: ManagerBasedRlEnv,
-  env_ids: torch.Tensor,
-  reset_event_name: str,
-  fall_stages: list[FallStage],
-  push_event_name: str | None = None,
-) -> dict[str, torch.Tensor]:
-  """Curriculum over fall/disturbance severity instead of velocity ranges.
-
-  Mirrors the structure of the original commands_vel (ordered stages keyed
-  by env.common_step_counter, each optionally overriding a subset of
-  params), but targets event term params instead of command term ranges:
-  start with mild near-upright disturbances, progress to full random falls
-  and stronger pushes as training advances.
-
-  Args:
-    env: The environment.
-    env_ids: Unused, kept for curriculum-manager call signature consistency.
-    reset_event_name: Name of the reset_fallen_state EventTerm in your event
-      manager config, whose orientation_mode/velocity_range get staged.
-    fall_stages: Ordered list of stages; each stage applies once
-      env.common_step_counter reaches its "step" value. Only keys present
-      and non-None in a stage override the current config -- omitted keys
-      leave the prior stage's value in place.
-    push_event_name: Optional name of a push_by_setting_velocity or
-      apply_body_impulse EventTerm whose force/torque ranges also get
-      staged via push_force_range/push_torque_range.
-  """
-  del env_ids  # Unused; curriculum applies globally via term cfg mutation.
-
-  reset_cfg = env.event_manager.get_term_cfg(reset_event_name)
-  assert reset_cfg is not None
-
-  push_cfg = None
-  if push_event_name is not None:
-    push_cfg = env.event_manager.get_term_cfg(push_event_name)
-    assert push_cfg is not None
-
-  for stage in fall_stages:
-    if env.common_step_counter >= stage["step"]:
-      if stage.get("orientation_mode") is not None:
-        reset_cfg.params["orientation_mode"] = stage["orientation_mode"]
-      if stage.get("velocity_range") is not None:
-        reset_cfg.params["velocity_range"] = stage["velocity_range"]
-      if push_cfg is not None:
-        if stage.get("push_force_range") is not None:
-          push_cfg.params["force_range"] = stage["push_force_range"]
-        if stage.get("push_torque_range") is not None:
-          push_cfg.params["torque_range"] = stage["push_torque_range"]
-        if stage.get("push_velocity_range") is not None:
-          push_cfg.params["velocity_range"] = stage["push_velocity_range"]
-
-  log: dict[str, torch.Tensor] = {
-    "orientation_mode_is_any": torch.tensor(
-      float(reset_cfg.params.get("orientation_mode") == "any")
-    ),
-  }
-  vel_range = reset_cfg.params.get("velocity_range") or {}
-  if "x" in vel_range:
-    log["init_lin_vel_x_min"] = torch.tensor(vel_range["x"][0])
-    log["init_lin_vel_x_max"] = torch.tensor(vel_range["x"][1])
-  if push_cfg is not None:
-    force_range = push_cfg.params.get("force_range")
-    if force_range is not None:
-      log["push_force_min"] = torch.tensor(force_range[0])
-      log["push_force_max"] = torch.tensor(force_range[1])
-
-  return log

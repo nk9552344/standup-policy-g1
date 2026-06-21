@@ -1,0 +1,576 @@
+================================================================================
+STAY-STAND POLICY — FULL CONTEXT DOCUMENT
+Last updated: 2026-06-21
+================================================================================
+
+This file captures the full research, all design decisions, all code changes,
+all diagnosed failures, and the current state of the stay-stand policy so a
+new conversation can resume without losing any context.
+
+================================================================================
+1. TASK DEFINITION
+================================================================================
+
+ORIGINAL TASK: The `standup` folder contained a RECOVERY policy:
+  - Robot spawns in a random FALLEN state (face-down, face-up, on side)
+  - Learns to get up from the ground
+  - Then holds still once standing
+
+CONVERSION GOAL: Change it to a STAY-STAND (balance) policy:
+  - Robot ALWAYS spawns STANDING (upright at HOME_KEYFRAME)
+  - Learns to BALANCE and not fall
+  - Learns to RECOVER from external pushes while staying upright
+  - A fall TERMINATES the episode immediately (no "get up again" phase)
+
+All work lives under:
+  vsls:/src/mjlab/tasks/standup/
+
+================================================================================
+2. ROBOT: UNITREE G1
+================================================================================
+
+  - 29 DOF total, 23 real actuated DOFs
+  - Pelvis standing height: 0.793 m (from g1.xml: <body name="pelvis" pos="0 0 0.793">)
+    This is the height when ALL JOINTS ARE AT ZERO (T-pose / fully extended)
+  - HOME_KEYFRAME (the actual standing pose used in training):
+      hip_pitch = -0.1 rad
+      knee      =  0.3 rad (bent)
+      ankle     = -0.2 rad
+    With these bent knees, actual pelvis height is ~0.72-0.75 m at rest.
+  - PD gains (from G1 constants / HoST reference):
+      Hip:   kp=150, kd=4
+      Knee:  kp=200, kd=6
+      Ankle: kp=40,  kd=2
+  - Why HOME_KEYFRAME instead of KNEES_BENT_KEYFRAME:
+    KNEES_BENT (hip=-0.312, knee=0.669, ankle=-0.363) is a forward-leaning
+    crouch. Gravitational ankle torque ≈ 20 N·m; ankle PD stiffness only
+    ≈ 10.5 N·m/rad. Robot falls in the first few sim steps before any policy
+    gradient exists. HOME_KEYFRAME has ankle torque ≈ 2 N·m — well within
+    the stiffness range.
+
+Action scale override in env_cfgs.py:
+  joint_pos_action.scale = {k: v * 0.25 for k, v in G1_ACTION_SCALE.items()}
+  Reason: G1_ACTION_SCALE is tuned for locomotion (knee ~0.35 rad per unit
+  raw action). For stay-stand, at iter 0 the MLP outputs ~1.0 per dim, which
+  means ~0.35 rad off default per joint before any learning. Multiplying by
+  0.25 limits worst-case random action to ~0.09 rad/joint, so pose/upright
+  rewards fire from iter 0.
+
+================================================================================
+3. REFERENCE: HoST (InternRobotics)
+================================================================================
+
+  URL: https://github.com/InternRobotics/HoST
+  This is a humanoid standing policy for G1 (and others). Key design decisions
+  we studied to diagnose our training failures:
+
+  A. REWARD STRUCTURE — Multiplicative, not additive
+     HoST multiplies all task rewards together instead of summing them:
+       self.rew_buf[:, task_group_index] *= rew
+     This means ALL task terms must be non-zero for any reward to flow.
+     We use additive rewards (standard MjLab approach).
+
+  B. UPWARD PULL FORCE BOOTSTRAP
+     HoST applies an upward force to the robot's base during early training:
+       force_tensor[:, base_indices, 2] = self.force  (e.g. 100 N)
+     The curriculum reduces this force as the robot improves.
+     This is a critical bootstrapping mechanism — our policy has NO equivalent.
+     We do not apply any upward assist. This is the biggest gap vs HoST.
+
+  C. NO ORIENTATION-BASED TERMINATION
+     HoST does NOT terminate on height or uprightness for the ground
+     standing policy. They terminate only on:
+       - Contact forces on specific body parts (elbow, shoulder, waist, knee, hip)
+       - Joint velocity overflow
+       - Base velocity overflow
+     Our `fell_over` term terminates on height + uprightness, which is
+     correct in principle but requires careful threshold tuning.
+
+  D. PUSH POLICY
+     HoST: push_robots = False for the G1 ground standing policy.
+     We: push_robot fires every 8-15s with ±0.3 m/s from iteration 0.
+     During early training, this is fine IF episodes are long enough (>8s)
+     for the push to fire. With the fell_over bug fixed and episodes now
+     extending to full 20s, pushes will fire once per episode.
+
+  E. OTHER HYPERPARAMETERS
+     - init_noise_std = 0.8 (we use 0.3 after fix, was 0.1)
+     - 6-step observation history (we use current step only)
+     - Episode length: 10s (we use 20s)
+     - action_scale = 1 with delta-position PD control (we use absolute)
+     - entropy_coef = 0 (same as us)
+
+================================================================================
+4. COMPLETE FILE CHANGE LOG (RECOVERY → STAY-STAND)
+================================================================================
+
+All changes were made across two sessions. Phase 1-2 in session 1,
+Phase 3 + diagnosis + fixes in session 2.
+
+────────────────────────────────────────────────────────────────────────────────
+4a. mdp/rewards.py  (Phase 1 — DONE)
+────────────────────────────────────────────────────────────────────────────────
+
+DELETED:
+  - standup_progress() function entirely (dense shaping toward standing height
+    + uprightness from fallen state — meaningless for stay-stand)
+  - _is_standing() helper (gating function, no longer needed)
+  - _is_standing gate from hold_still() — now fires unconditionally every step
+  - _is_standing gate from variable_posture.__call__() — same reason
+
+CHANGED:
+  - hold_still(env, std, asset_cfg): fires unconditionally, bounded exp kernel
+      return exp(-vel_error / std**2)  where vel_error = lin² + ang²
+
+  - body_angular_velocity_penalty: renamed to body_angular_velocity_penalty
+    (same name but changed from raw squared magnitude to bounded exp kernel):
+      return exp(-xy_sq / std**2)  where xy_sq = sum of x,y angular vel squared
+    Bounded to [0, 1]. Prevents value-function explosion during tumbling.
+
+  - angular_momentum_penalty: same change — raw squared magnitude → bounded
+    exp kernel:
+      return exp(-angmom_magnitude_sq / std**2)
+
+  - variable_posture.__init__: changed to use cfg.params["std_values"]
+    (single dict, no two-band logic). Old API had std_recovering / std_standing.
+    New API: std_values = {".*": 0.25} (one regex → one value)
+
+  - variable_posture.__call__: no gate, fires unconditionally every step
+
+IMPORTS ADDED: quat_apply_inverse (needed by fell_over in terminations.py)
+
+────────────────────────────────────────────────────────────────────────────────
+4b. mdp/terminations.py  (Phase 1 — DONE)
+────────────────────────────────────────────────────────────────────────────────
+
+ADDED:
+  - fell_over(env, min_height, min_uprightness=0.5, asset_cfg): NEW function
+    Terminates when: (height < min_height) | (uprightness < min_uprightness)
+    uprightness = -projected_gravity_b[:, 2]
+    Uses quat_apply_inverse to project gravity into body frame.
+    This is the primary failure signal for stay-stand.
+
+DELETED:
+  - stuck_no_progress() entirely (existed to cut off episodes where robot
+    stalled on ground — cannot happen in stay-stand since any ground contact
+    terminates via fell_over)
+
+KEPT UNCHANGED:
+  - time_out, catastrophic_state, out_of_terrain_bounds, nan_detection
+
+────────────────────────────────────────────────────────────────────────────────
+4c. mdp/curriculums.py  (Phase 2 — DONE)
+────────────────────────────────────────────────────────────────────────────────
+
+DELETED:
+  - fall_difficulty() function entirely (adjusted push/fall severity during
+    training stages — stay-stand uses fixed moderate push from iter 0)
+  - FallStage TypedDict (was used by fall_difficulty)
+
+KEPT:
+  - terrain_levels_standup(): kept, no min_step_counter parameter anymore.
+    Success criterion: episode ended via time_out (not fell_over) AND
+    robot was upright for sufficient fraction of the episode.
+
+────────────────────────────────────────────────────────────────────────────────
+4d. standup_env_cfg.py  (Phase 2 — DONE)
+────────────────────────────────────────────────────────────────────────────────
+
+CHANGED:
+  - push_robot event: velocity_range changed from {} (disabled) to
+    {"x": (-0.3, 0.3), "y": (-0.3, 0.3), "z": (-0.2, 0.2)}
+    Fixed moderate push from iteration 0 (no curriculum escalation needed —
+    the robot starts standing and push-recovery is a first-class skill).
+
+  - rewards["standup_progress"]: REMOVED from rewards dict entirely
+
+  - rewards["hold_still"].params: simplified to just {"std": math.sqrt(0.25)}
+    (removed min_standing_height, min_uprightness gating params)
+
+  - rewards["body_ang_vel"].params: now {"std": 1.0, "asset_cfg": ...}
+    (std_recovering etc. removed, single std)
+
+  - rewards["angular_momentum"].params: now {"sensor_name": "robot/root_angmom", "std": 1.0}
+
+  - rewards["pose"].params: now {"asset_cfg": ..., "std_values": {}}
+    (removed std_recovering/std_standing/min_standing gates)
+
+  - terminations["stuck_no_progress"]: REMOVED from terminations dict
+
+  - terminations["fell_over"]: ADDED with params:
+    {"min_height": MIN_STANDING_HEIGHT (=0.5), "min_uprightness": 0.5}
+
+  - curriculum: fall_difficulty entry REMOVED entirely
+
+  - curriculum["terrain_levels"]: no min_step_counter param anymore
+
+  - reset_base comment: updated to reflect standing-only orientation mode
+
+────────────────────────────────────────────────────────────────────────────────
+4e. config/g1/env_cfgs.py  (Phase 3 — DONE)
+────────────────────────────────────────────────────────────────────────────────
+
+REMOVED:
+  - _G1_PELVIS_STANDING_HEIGHT: float = 0.793 (was used for standup_progress
+    target_height, no longer used)
+  - standup_progress.weight = 2.0 override
+  - standup_progress.target_height override
+  - hold_still.min_standing_height override
+  - hold_still.min_standing_uprightness override
+  - pose.min_standing_height override
+  - pose.min_standing_uprightness override
+  - terrain_levels.min_step_counter override
+  - stuck_no_progress override
+
+CHANGED:
+  - cfg.rewards["pose"].params["std_values"] = {".*": 0.25}
+    (was two-band std_recovering/std_standing, collapsed to single band)
+  - cfg.rewards["pose"].weight = 10.0 (was 1.0)
+  - cfg.rewards["upright"].weight = 5.0 (was 2.0)
+  - cfg.rewards["upright"].params["std"] = 0.05 ** 0.5 (≈0.224)
+    Reason: default std=√0.2≈0.447 makes gradient nearly flat for small
+    tilts (10° tilt → reward 0.86 vs perfect 1.0). std=√0.05≈0.224 gives
+    sharper gradient (10° tilt → reward 0.55).
+  - G1 height overrides simplified to:
+      cfg.curriculum["terrain_levels"].params["min_standing_height"] = 0.65
+      cfg.terminations["fell_over"].params["min_height"] = 0.45  (AFTER FIX)
+      cfg.terminations["fell_over"].params["min_uprightness"] = 0.2  (AFTER FIX)
+  - body_ang_vel.weight: -0.05 → 0.0  (AFTER FIX — re-enable when stable)
+  - angular_momentum.weight: -0.01 → 0.0  (AFTER FIX — re-enable when stable)
+  - action_rate_l2.weight: -0.01 → 0.0  (AFTER FIX — re-enable when stable)
+
+KEPT:
+  - _G1_MIN_STANDING_HEIGHT: float = 0.65 (used for terrain curriculum)
+  - HOME_KEYFRAME as init_state (not KNEES_BENT_KEYFRAME)
+  - action scale *= 0.25
+
+────────────────────────────────────────────────────────────────────────────────
+4f. config/g1/rl_cfg.py  (Phase 3 — DONE, with subsequent fix)
+────────────────────────────────────────────────────────────────────────────────
+
+CHANGED:
+  - experiment_name: "g1_standup" → "g1_staystand"
+  - init_std: 0.1 → 0.3  (wider exploration without relying on std growth)
+  - learn_std: initially set to True during session 2, then REVERTED to False
+    See section 5 for why learn_std=True is catastrophic here.
+
+KEPT:
+  - entropy_coef = 0.0
+  - learning_rate = 3e-4, schedule = "fixed"
+  - clip_actions = 3.0
+  - hidden_dims = (512, 256, 128), activation = "elu"
+  - max_iterations = 30_000
+  - num_steps_per_env = 24
+  - save_interval = 50
+
+────────────────────────────────────────────────────────────────────────────────
+4g. config/g1/__init__.py  (Phase 3 — DONE)
+────────────────────────────────────────────────────────────────────────────────
+
+CHANGED:
+  - Task IDs renamed from "Mjlab-Standup-*" to "Mjlab-StayStand-*":
+      "Mjlab-StayStand-Rough-Unitree-G1"
+      "Mjlab-StayStand-Flat-Unitree-G1"
+
+================================================================================
+5. TRAINING FAILURE DIAGNOSIS AND FIXES
+================================================================================
+
+After completing all code conversion, training was started and the policy
+made NO progress. User confirmed all four failure symptoms:
+
+  SYMPTOM 1: Episodes end almost instantly (< 1 second)
+  SYMPTOM 2: fell_over fires on almost every episode
+  SYMPTOM 3: Policy std growing (e.g. 0.1 → 0.3+) — learn_std was True
+  SYMPTOM 4: All rewards near zero — policy is doing nothing
+
+────────────────────────────────────────────────────────────────────────────────
+ROOT CAUSE 1: fell_over thresholds too tight (MOST CRITICAL)
+────────────────────────────────────────────────────────────────────────────────
+
+BUG: env_cfgs.py had:
+  cfg.terminations["fell_over"].params["min_height"] = _G1_MIN_STANDING_HEIGHT
+  # _G1_MIN_STANDING_HEIGHT = 0.65
+
+HOME_KEYFRAME actual pelvis height ≈ 0.72–0.75 m (with bent knees).
+min_height = 0.65 is only 7–10 cm below standing height.
+
+Result: random policy actions (even at std=0.1) perturb the joints enough
+to drop the pelvis below 0.65 m within a handful of steps. Episodes terminate
+in < 1 second. The policy NEVER receives any reward because every episode
+ends before reaching any meaningful state.
+
+Additionally: min_uprightness = 0.5 (inheriting from base config) means the
+robot terminates at 60° of tilt. This is too aggressive for early training
+where the robot hasn't learned any corrective response.
+
+The base config (standup_env_cfg.py) has min_height = MIN_STANDING_HEIGHT = 0.5
+which is better, but the G1 override raised it to 0.65 — exactly wrong.
+
+FIX APPLIED:
+  cfg.terminations["fell_over"].params["min_height"] = 0.45
+  cfg.terminations["fell_over"].params["min_uprightness"] = 0.2
+
+  0.45 m = 57% of standing height = clearly fallen, not just crouching
+  min_uprightness = 0.2 allows ~80° of tilt before terminating
+
+WHEN TO TIGHTEN AGAIN:
+  Once the policy can reliably stand through full 20s episodes without
+  terminating, tighten back toward:
+    min_height → 0.55 (still gives recovery room)
+    min_uprightness → 0.35 (still allows significant push recovery)
+
+────────────────────────────────────────────────────────────────────────────────
+ROOT CAUSE 2: learn_std=True recreates the exact failure loop we fixed before
+────────────────────────────────────────────────────────────────────────────────
+
+BUG: rl_cfg.py had learn_std=True (mistakenly set during Phase 3).
+
+Mechanism:
+  Near-zero rewards
+  → noisy advantage estimates
+  → PPO's surrogate gradient pushes log_std up (actions that happened to
+    have slightly positive advantage increase both mean and std)
+  → larger, more chaotic actions
+  → robot falls more → shorter episodes → even less reward
+  → repeat (catastrophic feedback loop)
+
+The long comment in rl_cfg.py (about "std growing 0.1 → 0.18 → 0.28...")
+was written specifically about this exact failure mode with the RECOVERY policy.
+The stay-stand policy has the same structure (bounded exp rewards, sparse signal
+in early training) and therefore has the exact same failure mode.
+
+FIX APPLIED:
+  learn_std: False  (removes log_std from the optimizer entirely)
+  init_std: 0.3     (raised from 0.1 to give wider exploration coverage
+                     without relying on learned std growth)
+
+REASONING:
+  learn_std=False fixes std at init_std for the entire training run.
+  The policy improves ONLY by shaping the MEAN action, which is exactly
+  what we want for a "hold default pose while resisting pushes" task.
+  entropy_coef=0.0 means there is no push to grow std from entropy loss.
+
+────────────────────────────────────────────────────────────────────────────────
+ROOT CAUSE 3: Shaping penalties active before robot can stand
+────────────────────────────────────────────────────────────────────────────────
+
+BUG: body_ang_vel.weight=-0.05, angular_momentum.weight=-0.01,
+action_rate_l2.weight=-0.01 were all set non-zero in Phase 3.
+
+These are stability-shaping signals designed for a policy that ALREADY stands
+well and we want to make smoother. Activating them from iteration 0, when the
+robot can't stand at all (due to Bug 1), adds pure noise to the value function
+target. The value function tries to fit a sum of terms where 3 of them are
+always near-zero (robot can't earn positive rewards) and 3 are near-zero
+penalties (robot falls too fast to accumulate penalties). This corrupts
+gradient estimates.
+
+FIX APPLIED:
+  body_ang_vel.weight = 0.0
+  angular_momentum.weight = 0.0
+  action_rate_l2.weight = 0.0
+
+WHEN TO RE-ENABLE:
+  Once the robot can stand reliably (episode rewards non-zero and rising,
+  avg episode length > 10s), re-enable with small weights:
+    body_ang_vel.weight = -0.05
+    angular_momentum.weight = -0.01
+    action_rate_l2.weight = -0.01
+
+================================================================================
+6. CURRENT STATE OF ALL KEY FILES (after all fixes)
+================================================================================
+
+File: config/g1/rl_cfg.py
+  experiment_name = "g1_staystand"
+  distribution_cfg:
+    init_std = 0.3
+    std_type = "scalar"
+    learn_std = False   ← CRITICAL: must stay False
+  entropy_coef = 0.0
+  learning_rate = 3e-4, schedule = "fixed"
+  clip_actions = 3.0
+  num_steps_per_env = 24
+  max_iterations = 30_000
+
+File: config/g1/env_cfgs.py (key G1-specific overrides)
+  _G1_MIN_STANDING_HEIGHT = 0.65  (only used by terrain curriculum now)
+  init_state = HOME_KEYFRAME (hip_pitch=-0.1, knee=0.3, ankle=-0.2)
+  joint_pos_action.scale = G1_ACTION_SCALE * 0.25
+  pose.params["std_values"] = {".*": 0.25}
+  pose.weight = 10.0
+  upright.weight = 5.0
+  upright.params["std"] = 0.05 ** 0.5  (sharp gradient, ~0.224)
+  body_ang_vel.weight = 0.0      ← disabled until robot can stand
+  angular_momentum.weight = 0.0  ← disabled until robot can stand
+  action_rate_l2.weight = 0.0    ← disabled until robot can stand
+  terrain_levels.params["min_standing_height"] = 0.65
+  fell_over.params["min_height"] = 0.45       ← key fix
+  fell_over.params["min_uprightness"] = 0.2   ← key fix
+
+File: standup_env_cfg.py (base config)
+  MIN_STANDING_HEIGHT = 0.5  (base default for fell_over; G1 overrides to 0.45)
+  fell_over: min_height=0.5, min_uprightness=0.5 (base defaults)
+  episode_length_s = 20.0
+  push_robot: velocity_range = {"x": ±0.3, "y": ±0.3, "z": ±0.2}
+              interval_range_s = (8.0, 15.0)
+              fires from iteration 0
+  reset_base: orientation_mode="standing" (always spawns upright)
+  rewards: hold_still(weight=2.0), upright(weight=2.0), pose(weight=1.0)
+           body_ang_vel(weight=0.0), angular_momentum(weight=0.0)
+           action_rate_l2(weight=0.0), dof_pos_limits(weight=-0.05)
+           self_collision(weight=-0.1)
+
+File: mdp/terminations.py
+  fell_over(min_height, min_uprightness=0.5): height OR uprightness check
+  catastrophic_state(min_height=-0.5, max_height=3.0): sim sanity check
+  time_out, out_of_terrain_bounds, nan_detection
+
+File: mdp/rewards.py
+  hold_still: exp(-vel_error/std²), unconditional
+  upright: exp(-xy_sq/std²) toward vertical
+  variable_posture: single std_values band, unconditional
+  body_angular_velocity_penalty: exp(-xy_ang_vel_sq/std²), bounded
+  angular_momentum_penalty: exp(-angmom_sq/std²), bounded
+  [standup_progress: DELETED]
+
+File: mdp/curriculums.py
+  terrain_levels_standup: success = time_out AND upright fraction OK
+  [fall_difficulty: DELETED]
+
+================================================================================
+7. TRAINING TUNING ROADMAP
+================================================================================
+
+PHASE A (current — bootstrapping):
+  - Goals: robot can stand for full 20s without fell_over firing
+  - Indicators of success:
+    * avg episode length > 15s
+    * upright reward > 3.0 (out of max 5.0)
+    * pose reward > 5.0 (out of max 10.0)
+    * fell_over rate < 20%
+  - Active rewards: hold_still, upright, pose, dof_pos_limits, self_collision
+  - Disabled: body_ang_vel, angular_momentum, action_rate_l2
+  - Termination: fell_over (0.45m / 0.2 uprightness — loose)
+
+PHASE B (stability shaping):
+  - Trigger: PHASE A success indicators met
+  - Actions:
+    1. Re-enable body_ang_vel.weight = -0.05
+    2. Re-enable angular_momentum.weight = -0.01
+    3. Re-enable action_rate_l2.weight = -0.01
+    4. Tighten fell_over: min_height → 0.55, min_uprightness → 0.35
+  - Goal: robot actively damps oscillations and doesn't flap arms
+
+PHASE C (push recovery):
+  - Trigger: PHASE B stable, robot not falling from pushes
+  - Actions:
+    1. Tighten fell_over further: min_height → 0.60, min_uprightness → 0.5
+    2. Optionally increase push strength: ±0.5 m/s
+    3. Consider terrain curriculum progression
+  - Goal: robot recovers from hard pushes and returns to HOME_KEYFRAME
+
+FUTURE: Bootstrap mechanism (HoST-style upward pull force)
+  - HoST applies 100N upward on the base, reduces via curriculum
+  - If PHASE A is still stuck after hundreds of iterations, this may be
+    needed. Requires a new EventTerm that applies a body force in MuJoCo.
+  - Check if mjlab.envs.mdp.events has apply_body_force or similar.
+  - The force should be applied only to the base/pelvis body.
+  - Curriculum: start at 100N, reduce by (success_rate * step) toward 0.
+
+================================================================================
+8. WHAT TO TRY IF TRAINING IS STILL NOT LEARNING
+================================================================================
+
+In priority order:
+
+1. CHECK ACTUAL FELL_OVER THRESHOLD CALIBRATION
+   Run a zero-policy test (output all zeros): does the robot stand for 20s?
+   If not, the HOME_KEYFRAME starting position is still unstable for the
+   G1 actuator parameters. Fix: reduce ankle stiffness demands or adjust
+   HOME_KEYFRAME z-position slightly.
+
+2. CHECK EPISODE LENGTH DISTRIBUTION
+   After fixes, are episodes now > 5s on average? If they are still < 2s,
+   the fell_over thresholds may still be too tight. Lower min_uprightness
+   to 0.1 or raise min_height threshold even lower.
+
+3. ADD EXPLORATION HELP
+   init_std=0.3 gives ±0.075 rad per knee per step (0.3 * 0.25 * 1.0).
+   If the policy is stuck at a local zero (output all zeros = default pose),
+   temporarily raise init_std to 0.5 to force more exploration.
+
+4. HoST BOOTSTRAP (LAST RESORT)
+   If after 1000+ iterations the rewards are still near zero:
+   Add an upward force event that applies 50-100N to the pelvis body.
+   The robot will start "levitating" slightly, making it easy to earn
+   upright/pose rewards, then reduce the force as rewards improve.
+
+5. OBSERVATION HISTORY
+   HoST uses 6-step history. Our policy sees only the current step.
+   Adding history (concatenate last 3-6 observations) gives the policy
+   velocity information even if the IMU is noisy.
+
+================================================================================
+9. IMPORTANT CODE CONSTANTS AND THRESHOLDS REFERENCE
+================================================================================
+
+_G1_MIN_STANDING_HEIGHT = 0.65   (env_cfgs.py — used by terrain curriculum)
+HOME_KEYFRAME actual pelvis height ≈ 0.72-0.75 m
+T-pose pelvis height = 0.793 m (from MJCF)
+
+fell_over.params["min_height"] = 0.45      (G1 override in env_cfgs.py)
+fell_over.params["min_uprightness"] = 0.2  (G1 override in env_cfgs.py)
+
+Base config fell_over defaults (standup_env_cfg.py):
+  MIN_STANDING_HEIGHT = 0.5 → fell_over min_height = 0.5
+  fell_over min_uprightness = 0.5
+
+PD Gains (G1):  Hip kp=150/kd=4, Knee kp=200/kd=6, Ankle kp=40/kd=2
+Action scale:   G1_ACTION_SCALE * 0.25 (locomotion scale * 0.25)
+Episode length: 20 seconds
+Push interval:  8–15 seconds (fires once per episode on average)
+Push strength:  ±0.3 m/s x/y, ±0.2 m/s z
+
+PPO settings:
+  init_std = 0.3 (fixed, learn_std=False)
+  entropy_coef = 0.0
+  learning_rate = 3e-4, schedule = "fixed"
+  clip_actions = 3.0
+  clip_param = 0.2
+  gamma = 0.99, lam = 0.95
+  num_steps_per_env = 24
+  num_mini_batches = 4
+  num_learning_epochs = 5
+  max_iterations = 30_000
+
+================================================================================
+10. TASK REGISTRY
+================================================================================
+
+  "Mjlab-StayStand-Rough-Unitree-G1"  → unitree_g1_rough_env_cfg()
+  "Mjlab-StayStand-Flat-Unitree-G1"   → unitree_g1_flat_env_cfg()
+
+  Defined in: vsls:/src/mjlab/tasks/standup/config/g1/__init__.py
+
+================================================================================
+11. COMMON COMMANDS
+================================================================================
+
+Type check:
+  uv run ty check        (fast)
+  uv run pyright         (thorough)
+
+Run tests:
+  uv run pytest tests/   (full suite)
+
+Format + lint:
+  uv run ruff format
+  uv run ruff check --fix
+
+Or via Makefile:
+  make check   = format + lint + type check
+  make test    = full test suite
+
+================================================================================
