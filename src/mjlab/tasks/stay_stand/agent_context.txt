@@ -1,0 +1,268 @@
+================================================================================
+STAY-STAND TASK: AGENT CONTEXT
+================================================================================
+
+Purpose of this file
+--------------------
+This is a context document for any AI coding agent (Claude, Copilot, etc.) that
+picks up work on the stay_stand task. It captures the *why* behind the current
+design and the debugging history so that you don't repeat past mistakes or
+"clean up" code that exists for a specific reason.
+
+================================================================================
+1. TASK GOAL
+================================================================================
+
+Train a Unitree G1 humanoid RL policy that, when applied to a G1 robot already
+standing upright at the KNEES_BENT keyframe, keeps the robot standing
+indefinitely. No locomotion, no commands - just stay balanced.
+
+Constraints the user emphasized:
+- "This is a very simple policy so do not make this any complex."
+- "Write comments minimal, only important ones."
+- "DO NOT MAKE ANY ASSUMPTIONS." -> Always verify by reading existing code
+  (cartpole, velocity, mdp utilities) before adding/changing anything.
+
+================================================================================
+2. ARCHITECTURE & FILES
+================================================================================
+
+Directory layout (follows cartpole's pattern - NO `mdp/` subfolder):
+
+  src/mjlab/tasks/stay_stand/
+    __init__.py                     # Package marker, single-line docstring only.
+    stay_stand_env_cfg.py           # make_stay_stand_env_cfg() -> base env cfg.
+    agent_context.txt               # THIS FILE.
+    config/
+      __init__.py                   # Empty.
+      g1/
+        __init__.py                 # register_mjlab_task(
+                                    #   "Mjlab-StayStand-Unitree-G1", ...)
+        env_cfgs.py                 # unitree_g1_stay_stand_env_cfg(play=False).
+        rl_cfg.py                   # unitree_g1_stay_stand_ppo_runner_cfg().
+
+Cartpole has no `mdp/` subfolder - it imports everything from `mjlab.envs.mdp`.
+Stay_stand follows the same convention. Do NOT add an `mdp/` subfolder unless
+you need task-specific reward / observation / event functions that don't exist
+in `mjlab.envs.mdp`.
+
+Registry: `Mjlab-StayStand-Unitree-G1` is auto-discovered via
+`import_packages` (which blacklists `utils` and `.mdp`). No manual registration
+needed beyond calling `register_mjlab_task` in `config/g1/__init__.py`.
+
+Run commands (from repo root, on the Mac/Linux box where uv is set up):
+
+  uv run train Mjlab-StayStand-Unitree-G1
+  uv run play  Mjlab-StayStand-Unitree-G1 --checkpoint-file logs/...
+
+================================================================================
+3. KEY FRAMEWORK FACTS (verified during this session)
+================================================================================
+
+mjlab framework
+- ManagerBasedRlEnvCfg from `mjlab.envs`.
+- Scene with `TerrainEntityCfg(terrain_type="plane")`, num_envs=1 default
+  (vectorized at runtime).
+- decimation=4, timestep=0.005 -> control dt = 0.02 s -> 50 Hz policy.
+- `scale_rewards_by_dt=True` is the default: ALL reward weights are
+  effectively multiplied by 0.02 per step. Keep this in mind when sizing
+  weights vs. wandb numbers.
+
+mdp.posture (in `mjlab/envs/mdp/rewards.py`)
+- Formula: `exp(-mean(error**2 / std**2))`.
+- error = current_joint_pos - default_joint_pos, per joint.
+- The MEAN is critical: tight std on ANY joint pulls the reward toward 0.
+- `std` is a dict of {joint_name_regex: float}. Default `{".*": x}` covers
+  all joints uniformly.
+- This is a class (resolves std into a tensor at construction).
+
+mdp.flat_orientation_l2
+- Returns sum(projected_gravity_b[:, :2]**2). Pure L2 penalty.
+- Zero gradient when perfectly upright. Used with NEGATIVE weight.
+
+mdp.upright (in `mjlab/tasks/velocity/mdp/rewards.py`)
+- Shaped POSITIVE reward: `exp(-xy_squared / std**2)`. Returns 1.0 when
+  upright, smoothly decays. We do NOT import this cross-task (would
+  introduce a velocity dependency); using flat_orientation_l2 instead.
+
+mdp.is_alive / mdp.bad_orientation / mdp.time_out
+- is_alive: 1.0 if not terminated, 0.0 otherwise.
+- bad_orientation(limit_angle): True when torso tilt exceeds limit_angle.
+- time_out: True when episode reaches `episode_length_s`. Pair with
+  `time_out=True` flag in TerminationTermCfg so it doesn't penalize the
+  policy (handled separately by the manager).
+
+Events
+- `mode="interval"` sampled from `interval_range_s` on each reset, so the
+  first push fires interval_range_s seconds INTO the episode (not at t=0).
+- `mode="startup"` fires once at startup (used for DR like foot_friction).
+- `mode="reset"` fires on every env reset.
+
+G1 robot specifics
+- 29 joints (legs, waist, arms, wrists). Default keyframe is
+  KNEES_BENT_KEYFRAME at z=0.76 with hip_pitch=-0.312, knee=0.669,
+  ankle_pitch=-0.363, plus arm offsets.
+- Actuators: 5020, 7520_14, 7520_22, 4010, WAIST, ANKLE - each is a
+  BuiltinPositionActuatorCfg with stiffness/damping/effort_limit set.
+- G1_ACTION_SCALE: dict[joint_name, float] = 0.25 * effort_limit / stiffness
+  per joint. Per-joint scaling applied via JointPositionActionCfg.scale.
+- `use_default_offset=True` means joint_target = default_pos + scale * action.
+  -> action=0 commands the robot to hold the KNEES_BENT pose.
+
+================================================================================
+4. CURRENT CONFIGURATION (post-debugging) - DO NOT REGRESS
+================================================================================
+
+stay_stand_env_cfg.py
+- Observations (actor + critic identical, proprioceptive only):
+    base_lin_vel, base_ang_vel, projected_gravity, joint_pos_rel,
+    joint_vel_rel, last_action. enable_corruption=True for actor (Unoise),
+    False for critic.
+- Action: single JointPositionActionCfg over all actuators, scale set
+  per-robot.
+- Events: reset_base (very small noise), reset_robot_joints (zero noise).
+  NO push_robot, NO foot_friction, NO encoder_bias, NO base_com. These
+  were removed because they were destabilizing learning before the policy
+  could even stand. Add them back as a phase-2 fine-tune.
+- Rewards (only THREE, intentionally):
+    alive   weight=+3.0   # Strong survival incentive.
+    posture weight=+5.0, std={".*": 0.4}   # Dominant shaped positive.
+    upright weight=-3.0   # Direct quadratic gradient toward vertical.
+- Terminations: time_out + fell_over @ math.radians(80.0). 80deg is very
+  permissive to give the policy room to explore; tighten later.
+- Sim: timestep=0.005, iterations=10, ls_iterations=20, decimation=4,
+  episode_length_s=20.0.
+
+config/g1/env_cfgs.py
+- Sets sim.njmax=300, ccd_iterations=50, contact_sensor_maxmatch=64 (flat-
+  ground optimization).
+- Wires viewer.body_name="torso_link".
+- Overrides posture std with _G1_POSTURE_STD (loose per-joint values
+  ranging from 0.20 to 0.60). Hip_pitch/knee/ankle get the tighter values
+  but still LOOSER than what velocity G1 uses for standing (0.05).
+  Rationale: velocity G1's track_velocity rewards dominate, so its tight
+  posture std doesn't matter. Here posture IS the dominant positive
+  signal, so it must fire reliably.
+- play=True: sets episode_length_s=1e9 and disables actor obs corruption.
+
+config/g1/rl_cfg.py
+- Actor/critic MLPs: hidden_dims=(256, 128, 64), ELU, obs_normalization=True.
+- Distribution: GaussianDistribution, init_std=0.3, std_type="scalar".
+  *** init_std MUST stay small. See section 5 below. ***
+- PPO: lr=1e-3 with adaptive KL schedule (desired_kl=0.01),
+  entropy_coef=0.001 (intentionally low), clip_param=0.2,
+  num_learning_epochs=5, num_mini_batches=4, num_steps_per_env=24,
+  gamma=0.99, lam=0.95, max_grad_norm=1.0.
+- experiment_name="g1_stay_stand", save_interval=50, max_iterations=3000.
+
+================================================================================
+5. DEBUGGING HISTORY (read this before changing config!)
+================================================================================
+
+Symptom 1: After 2999 iter, episodes terminated in ~10 steps (0.2 s),
+entropy climbing, net negative reward.
+
+Diagnosis 1:
+- mdp.posture with std=0.05-0.15 + 0.1 rad joint error -> exp(-mean(4))
+  ~= 0.018. The "positive" reward was essentially zero.
+- fell_over @ 60deg was too strict for early high-entropy exploration.
+- Penalties (joint_vel_l2, joint_acc_l2, action_rate_l2, dof_pos_limits)
+  outweighed the tiny positives -> entropy bonus pushed std UP, which
+  pushed reward further down.
+
+Fix attempt 1 (loosen std + raise threshold + reduce noise): didn't help
+enough. Reward still declined from 4 to 2 over 1400 iter.
+
+Symptom 2: After fix 1, mean_reward declined 4 -> 2 over training,
+mean_std rose 1.0 -> 1.25, mean_episode_length shrank 80 -> 60.
+Random initial policy was BEATING the trained policy.
+
+Diagnosis 2 (the real root cause):
+- init_std=1.0 with per-joint G1_ACTION_SCALE ~0.05-0.15 rad produced
+  joint perturbations large enough to topple G1 in 1-2 s, BEFORE PPO
+  could collect any meaningful gradient.
+- entropy_coef=0.01 actively INFLATED std when the policy gradient was
+  weak (which it was, because the robot kept dying).
+- dof_pos_limits weight=-0.5 * 29 joints * ~0.25 rad violation during
+  falls = HUGE negative spike (~-3 per step pre-dt) that drowned the
+  small positive signals every time the robot started to fall.
+- joint_vel_l2, joint_acc_l2, action_rate_l2 also spike during falls.
+- DR (foot_friction, encoder_bias, base_com) + push_robot added
+  variance the policy couldn't yet handle.
+
+Fix attempt 2 (CURRENT STATE):
+- init_std: 1.0 -> 0.3 (most important change).
+- entropy_coef: 0.01 -> 0.001.
+- Stripped to 3 rewards: alive (+3), posture (+5, std 0.4), upright (-3).
+- Removed all DR events and push_robot from base config.
+- Loosened _G1_POSTURE_STD further (knee 0.45 -> 0.50, etc.).
+- Kept fell_over @ 80deg for permissive early exploration.
+
+Why velocity G1 works with init_std=1.0 but stay_stand doesn't
+- Velocity G1 has track_lin_vel + track_ang_vel as dominant positive
+  rewards (weight=2.0 each). When command is 0 and actual is 0, these
+  fire at value 1.0. The walking robot is ACTIVELY moving and PD-control
+  recovers from perturbations.
+- Stay-stand has no command. Posture is the only positive signal, and
+  without active motion the robot must hold a delicate balance. The
+  exploration noise that's fine for a walker is destabilizing for a
+  stander.
+
+================================================================================
+6. EXPECTED TRAINING SIGNATURE (post-fix)
+================================================================================
+
+When standing well (per step, BEFORE dt scaling):
+  alive   = 3.0 * 1.0           = +3.0
+  posture = 5.0 * ~1.0          = +5.0
+  upright = -3.0 * ~0.0         = ~0.0
+  total ~ +8.0 per step pre-dt -> +0.16 per step after dt=0.02
+  Over a full 1000-step episode: ~160 reward.
+
+Healthy training plots:
+- Train/mean_reward: should climb (was declining 4 -> 2).
+- Train/mean_episode_length: should grow toward 1000 (= 20 s).
+- Policy/mean_std: should DECREASE from 0.3 over time as policy gains
+  confidence. If it climbs, entropy_coef is still too high or rewards
+  are still net-negative.
+
+If reward stays flat / declines after these fixes, NEXT THINGS TO TRY:
+1. Verify KNEES_BENT_KEYFRAME is actually stable in sim with action=0
+   (smoke test: spawn G1 with no policy, just zero actions, check if it
+   stays up for 20 s).
+2. Lower init_std further (0.3 -> 0.15).
+3. Set entropy_coef=0.0 to fully kill the std-inflation pressure.
+4. Reduce decimation to 2 (100 Hz policy) so the policy can react faster
+   to balance perturbations.
+5. Add base_lin_vel_l2 and base_ang_vel_l2 penalties (small weight, like
+   -0.01) to explicitly reward "stay still".
+
+================================================================================
+7. THINGS NOT TO DO
+================================================================================
+
+- DO NOT add an mdp/ subfolder. Cartpole doesn't have one. Stay simple.
+- DO NOT re-add push_robot, foot_friction, encoder_bias, base_com,
+  joint_vel_l2, joint_acc_l2, action_rate_l2, dof_pos_limits to the base
+  config without re-reading section 5. These were removed for specific
+  reasons. Add them as a SECOND-STAGE fine-tune on a converged policy.
+- DO NOT raise init_std back toward 1.0. That was the primary failure
+  mode.
+- DO NOT tighten posture std below 0.2 for legs until the policy
+  converges. The reward will collapse.
+- DO NOT import from mjlab.tasks.velocity.* (cross-task dependency).
+- DO NOT add docstrings, comments, type annotations to code you didn't
+  change. User explicitly asked for minimal comments.
+
+================================================================================
+8. ENVIRONMENT QUIRKS
+================================================================================
+
+- User works on a Mac via VS Code Live Share; the agent's terminal is
+  Windows PowerShell. `uv run` commands must be run by the user on the
+  Mac side. Verification on the agent side is done via static analysis
+  (get_errors, grep_search, read_file).
+- Workspace is exposed as `vsls:/` scheme. Use absolute `vsls:/...` paths
+  in tool calls.
+- AGENTS.md mandates running `make check` and `make test` before commits.
+  Type-check with `uv run ty check` or `uv run pyright`.
