@@ -200,26 +200,38 @@ def unitree_g1_rough_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
 
   # UPRIGHT GATED BY FEET CONTACT: the primary balance signal (weight 10).
   # Returns upright_score × feet_gate where:
-  #   upright_score = exp(-xy²/std²) \u2208 [0, 1] -- torso uprightness
-  #   feet_gate     = clamp(foot_force / bodyweight, 0, 1) \u2208 [0, 1]
+  #   upright_score = exp(-xy²/std²) ∈ [0, 1] -- PELVIS uprightness
+  #   feet_gate     = clamp(foot_force / bodyweight_n, 0, 1) ∈ [0, 1]
   #
-  # The gate makes it IMPOSSIBLE to earn the primary reward without bearing
-  # weight through the legs:
-  #   arm-only balance: feet leave ground → gate=0 → reward=0
-  #   proper balance:   feet bear weight  → gate=1 → reward=upright_score
-  # This directly prevents the "arm-only" local optimum that emerged at
-  # ~1500 iterations in previous runs.
-  cfg.rewards["upright_gated"].params["asset_cfg"].body_names = ("torso_link",)
+  # KEY DESIGN DECISIONS vs previous iteration:
+  #
+  # 1. Track PELVIS (root link), NOT torso_link.
+  #    Torso tracking allowed the "waist-compensation" local optimum:
+  #    robot bends at the waist (torso stays upright) while the pelvis falls,
+  #    earning full upright reward without using any leg joints.
+  #    Pelvis tracking makes this impossible: only leg corrections
+  #    (ankle/knee/hip) can keep the pelvis upright.
+  #    body_names=() → asset_cfg.body_ids is falsy → uses root_link_quat_w.
+  #
+  # 2. bodyweight_n = G1_MASS × 9.8 / 2 = 112.5 N (half-bodyweight threshold).
+  #    Using full bodyweight (225 N) means the gate drops when one foot lifts
+  #    to step, penalising stepping and discouraging the stepping reflex.
+  #    Using half-bodyweight: gate = 1.0 whenever either foot bears full load.
+  #      both feet standing:    total_force ≈ 225 N → gate = clamp(2.0, 0, 1) = 1.0
+  #      stepping (one foot):   total_force ≈ 112 N → gate = clamp(1.0, 0, 1) = 1.0
+  #      airborne:              total_force = 0 N   → gate = 0.0
+  #    This allows free stepping to catch pushes without any reward penalty.
+  cfg.rewards["upright_gated"].params["asset_cfg"].body_names = ()  # pelvis / root link
   cfg.rewards["upright_gated"].params["std"] = _upright_std
   cfg.rewards["upright_gated"].params["sensor_name"] = feet_ground_cfg.name
-  cfg.rewards["upright_gated"].params["bodyweight_n"] = 225.0  # ~23 kg × 9.8 N
+  cfg.rewards["upright_gated"].params["bodyweight_n"] = 112.5  # half-bodyweight
   cfg.rewards["upright_gated"].weight = 10.0
 
-  # Reward balance (per-step max when perfectly standing with feet down):
-  #   upright_gated: 10.0 × 1.0 × 1.0 = 10.0  (PRIMARY - requires legs)
-  #   feet_bearing:   5.0 × 0.76     =  3.8  (secondary - saturates at tanh(1))
-  #   pose:           2.0 × 1.0      =  2.0  (regularization)
-  #   hold_still:     2.0 × ~0.5     = ~1.0  (small base velocity while balancing)
+  # Reward balance (per-step max when standing with both feet down):
+  #   upright_gated: 10.0 × 1.0 × 1.0 = 10.0  (PRIMARY — pelvis + legs required)
+  #   feet_bearing:   5.0 × 0.76     =  3.8  (extra incentive for symmetric loading)
+  #   pose:           2.0 × 1.0      =  2.0  (regularization, prevents extreme joints)
+  #   hold_still:     2.0 × ~0.5     = ~1.0  (penalises large base velocity / falls)
   #   Total max per step ≈ 16.8
   cfg.rewards["pose"].weight = 2.0
 
@@ -237,6 +249,12 @@ def unitree_g1_rough_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   # G1 standing height overrides -- terrain curriculum and fell_over
   # termination both use the same "is standing" threshold.
   cfg.curriculum["terrain_levels"].params["min_standing_height"] = _G1_MIN_STANDING_HEIGHT
+  # TIGHTEN PROMOTION CRITERION: default min_standing_uprightness=0.8 (cos37°)
+  # is too loose -- the robot got promoted at only 37° average tilt, immediately
+  # failed on harder terrain, and repeated in a ~600-step oscillation cycle that
+  # prevents consistent learning. Setting 0.95 (cos18°) requires near-perfect
+  # uprightness for promotion so only a genuinely stable policy advances.
+  cfg.curriculum["terrain_levels"].params["min_standing_uprightness"] = 0.95
 
   # fell_over thresholds: these must NOT be close to the HOME_KEYFRAME height
   # (~0.72-0.75 m with bent knees). min_height=0.65 is only 7-10 cm below
@@ -266,6 +284,17 @@ def unitree_g1_rough_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   cfg.rewards["feet_bearing_weight"].params["sensor_name"] = feet_ground_cfg.name
   cfg.rewards["feet_bearing_weight"].params["bodyweight_n"] = 225.0  # ~23 kg × 9.8
   cfg.rewards["feet_bearing_weight"].weight = 5.0
+
+  # BASE HEIGHT REWARD: continuous height gradient from standing (0.72 m) down
+  # to the fell_over floor (0.45 m). Without this, the robot can earn full
+  # upright_gated while slowly squatting because pelvis orientation alone does
+  # not penalise downward displacement. Gaussian centred at HOME_KEYFRAME actual
+  # pelvis height (~0.72 m with bent knees); std=0.10 m gives exp(-1)≈0.37 at
+  # 10 cm below target and ≈0 near the 0.45 m fell_over threshold.
+  # This adds a direct gradient for legs to support body weight at the right height.
+  cfg.rewards["base_height"].params["target_height"] = 0.72  # HOME actual pelvis z
+  cfg.rewards["base_height"].params["std"] = 0.10
+  cfg.rewards["base_height"].weight = 3.0
 
   # air_time, foot_clearance, foot_slip overrides removed: these reward
   # terms don't exist in standup_env_cfg.py (dropped upstream as gait-cycle-

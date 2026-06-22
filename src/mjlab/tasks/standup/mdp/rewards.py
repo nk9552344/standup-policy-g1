@@ -88,6 +88,33 @@ def hold_still(
   return torch.exp(-vel_error / std**2)
 
 
+def base_height_reward(
+  env: ManagerBasedRlEnv,
+  target_height: float,
+  std: float,
+  asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+  """Reward the pelvis being at standing height.
+
+  Returns exp(-((height - target_height) / std)²): 1.0 at exactly target_height,
+  decaying symmetrically below and above. For stay-stand this fills the gap
+  between the fell_over termination threshold (0.45 m) and the actual standing
+  height (~0.72 m): without this reward a policy can earn full upright_gated
+  score while slowly squatting downward, since upright orientation alone does
+  not penalise downward displacement.
+
+  target_height: desired pelvis z in metres. HOME_KEYFRAME with bent knees
+    gives an actual pelvis height of ~0.72 m (not 0.783 m which is the raw
+    MJCF spawn z). Override per-robot.
+  std: kernel width in metres. 0.10 m gives exp(-1)≈0.37 when 10 cm below
+    target and approaches 0 near the 0.45 m fell_over floor.
+  """
+  asset: Entity = env.scene[asset_cfg.name]
+  height = asset.data.root_link_pos_w[:, 2]  # [B] world-frame pelvis z
+  error = height - target_height             # [B]
+  return torch.exp(-(error**2) / std**2)
+
+
 class upright:
   """Reward for keeping the base upright.
 

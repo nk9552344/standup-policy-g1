@@ -319,6 +319,15 @@ def make_standup_env_cfg() -> ManagerBasedRlEnvCfg:
         "std": math.sqrt(0.25),
       },
     ),
+    "base_height": RewardTermCfg(
+      func=mdp.base_height_reward,
+      weight=0.0,  # Override per-robot.
+      params={
+        "target_height": 0.6,  # Override per-robot (~HOME_KEYFRAME pelvis height).
+        "std": 0.1,            # Override per-robot.
+        "asset_cfg": SceneEntityCfg("robot"),
+      },
+    ),
     "upright": RewardTermCfg(
       func=mdp.upright,
       weight=2.0,
