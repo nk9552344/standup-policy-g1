@@ -1,6 +1,6 @@
 ================================================================================
 STAY-STAND POLICY — FULL CONTEXT DOCUMENT
-Last updated: 2026-06-21
+Last updated: 2026-06-22
 ================================================================================
 
 This file captures the full research, all design decisions, all code changes,
@@ -652,5 +652,280 @@ EXPECTED EFFECT ON CHARTS:
   - Episode_Reward/pose: will drop (lower weight) but that's intentional
   - mean_reward scale will shift (upright now 10 = bigger positive term)
   - Policy should learn CORRECTIVE ACTIONS that actually reduce tilt
+
+================================================================================
+13. TRAINING FAILURE DIAGNOSIS — SESSION 4 (2026-06-22)
+================================================================================
+
+Training showed: mean_reward declining from ~19 to ~16 over 200 iterations.
+mean_episode_length declining from ~62 to ~58. User observation: "robot
+is not using its legs and foot at all to balance. It is just using its
+upper body (torso/chest). The train/reward graph is decreasing in long run."
+
+CHARTS OBSERVED:
+  - Train/mean_reward: 19→16, monotone decline
+  - Train/mean_episode_length: 62→58, slow decline
+  - Episode_Reward/upright_gated: 0.4-0.6 declining to ~0.3
+  - Episode_Reward/pose: 0.04-0.12, declining (kernel ~0.08 ⇒ joints far
+    from HOME on average)
+  - Episode_Reward/hold_still: 0.01-0.04, declining (robot moving fast)
+  - Episode_Reward/ankle_corrective: 0-0.10 oscillating, low average
+  - Episode_Reward/self_collision: 0 to -0.012, getting more negative
+    (more pelvis-subtree self-contact = more flailing)
+  - Episode_Reward/upright: flat at 0 (weight=0, expected)
+
+ROOT CAUSE (CRITICAL): Inverted kernel sign in body_angular_velocity_penalty
+                       and angular_momentum_penalty
+────────────────────────────────────────────────────────────────────────────────
+
+Both functions returned ``exp(-x²/std²)`` ∈ [0, 1] — a kernel that is
+MAXIMUM at zero motion and MINIMUM at high motion. Every other
+``exp(-x²/std²)`` reward in rewards.py (upright, pose, hold_still,
+base_height, upright_gated, variable_posture) is paired with a POSITIVE
+weight because that kernel shape is a STABILITY REWARD. These two
+"penalties" used the same kernel but with NEGATIVE weight, which inverts
+the semantics:
+
+  - At rest (ang_vel=0): kernel=1.0,  reward = -0.05 × 1.0 = -0.05/step
+                                              (PENALTY FOR BEING STILL!)
+  - Torso swinging:      kernel≈0,    reward = -0.05 × 0   ≈  0/step
+                                              (NO PENALTY FOR SPINNING!)
+
+PPO sees: "more torso angular velocity → less negative reward". The
+gradient consistently rewards the torso-swing strategy. This explains:
+
+  1. WHY the robot uses ONLY upper body for balance: the reward gradient
+     ACTIVELY TRAINS torso swinging. The "penalty" the comment in env_cfgs.py
+     described was the opposite of what the function returned.
+
+  2. WHY rewards decline over time: as the policy discovers torso swinging,
+     upper-body joints deviate from HOME → pose kernel collapses
+     (0.08 = exp(-2.5) ≈ 0.4 rad mean joint deviation). The small body_ang_vel
+     "reward" of +0.05/step gained by swinging is dwarfed by the -2/step
+     loss from pose + the -3/step loss from upright_gated as the pelvis
+     follows the torso. Net effect: monotonic decline.
+
+  3. WHY this persisted across sessions 1-3: the kernel implementation
+     looked plausible ("bounded exp kernel for safety against value
+     divergence") and the negative weight looked intentional ("penalty").
+     Nobody noticed that the COMBINATION inverts the intended cost shape.
+
+FIX APPLIED (session 4):
+────────────────────────────────────────────────────────────────────────────────
+
+  File: vsls:/src/mjlab/tasks/standup/mdp/rewards.py
+  1. body_angular_velocity_penalty kernel:
+     OLD: return torch.exp(-xy_sq / std**2)              # 1 at rest, 0 at chaos
+     NEW: return 1.0 - torch.exp(-xy_sq / std**2)        # 0 at rest, 1 at chaos
+  2. angular_momentum_penalty kernel: same fix.
+
+  File: vsls:/src/mjlab/tasks/standup/config/g1/env_cfgs.py
+  3. body_ang_vel.weight:        -0.05 → -0.5
+     With the corrected kernel, -0.05 would give a too-weak signal. -0.5 makes
+     a 2 rad/s torso swing cost ~ -0.49/step (kernel = 1-exp(-4) ≈ 0.98),
+     while a normal 0.3 rad/s balance correction costs only -0.04/step
+     (kernel = 1-exp(-0.09) ≈ 0.086). Strong against the failure mode,
+     soft on legitimate corrections.
+  4. angular_momentum.weight:    0.0 → -0.5
+     Was disabled in session 3 due to value-function-divergence concerns.
+     With the kernel fix, the function is bounded [0, 1] and cannot blow up,
+     so it's safe to enable. Adds a brake on any rotation-based strategy
+     (waist twist, arm flail) not captured by body_ang_vel's torso-only
+     pitch/roll signal.
+
+WHY THIS SHOULD FIX THE TRAINING FAILURE:
+  - Torso-swing strategy now has a -0.5/step cost when active. Over a 58-step
+    episode, that's -29 per episode of swinging, which is enormous compared
+    to the ~+5 the strategy buys in transient upright_gated improvements.
+  - Pose reward gradient pushing joints toward HOME is no longer competing
+    against an INVERTED penalty pushing toward chaos. Both gradients now
+    align in the "stay still + use legs" direction.
+  - ankle_corrective + feet_bearing_weight + base_height + upright_gated are
+    all positive rewards for using legs properly. With torso-swing taxed,
+    these become the dominant learnable strategies.
+
+NOT YET CHANGED (deliberately conservative):
+  - pose std remains uniform at 0.25 across all joints. A per-joint std
+    partition (tight on waist/shoulders, loose on legs) was considered to
+    further punish torso movement, but earlier-session notes record that
+    a previous loose-leg-std attempt drove fell_over=1.0 from iter 0.
+    Defer this until the kernel fix is validated empirically.
+  - upright weight (0), pose weight (2), upright_gated (10), feet_bearing
+    (5), base_height (3), ankle_corrective (3), hold_still (2): unchanged.
+    The fix is in the kernel, not the balance of positive rewards.
+
+EXPECTED EFFECT ON CHARTS:
+  - Train/mean_reward: should stop declining and begin rising (the largest
+    source of mis-directed gradient is removed).
+  - Episode_Reward/pose: should rise toward 0.5+ as joints stay near HOME.
+  - Episode_Reward/hold_still: should rise (less spinning ⇒ lower vel error).
+  - Episode_Reward/upright_gated: should rise as the policy learns proper
+    leg-based balance.
+  - Episode_Reward/ankle_corrective: should become more consistently positive.
+  - Episode_Reward/self_collision: should approach 0 (less flailing).
+  - NEW metrics will appear: Episode_Reward/body_ang_vel and
+    /angular_momentum will now be visible as small negative values during
+    legitimate corrections and larger negative values during any residual
+    swinging behaviour.
+
+WHAT TO DO IF REWARDS STILL DECLINE AFTER THIS FIX:
+  1. Per-joint pose std partition (waist=0.10, shoulders=0.15, elbow=0.20,
+     hip=0.30, knee/ankle=0.40). Directly taxes upper-body deviation while
+     allowing leg corrections. Requires partitioning the joint name patterns
+     into a one-to-one mapping (see resolve_matching_names_values in
+     src/mjlab/utils/lab_api/string.py).
+  2. Reduce body_ang_vel std to 0.5 rad/s. Saturates the penalty at lower
+     angular velocities so the policy is taxed earlier in any swing motion.
+  3. Stage angular_momentum_penalty in only after body_ang_vel stabilises,
+     to isolate which signal is doing what.
+
+================================================================================
+14. TRAINING FAILURE DIAGNOSIS — SESSION 5 (2026-06-22)
+================================================================================
+
+Training after session 4 fixes: rewards still declining. User observation:
+"the robot is using its feets, but not properly. and it is not using its
+knees at all. like when the robot leans forward, then legs should help the
+robot to regain its balance by stepping forward or something. the robot is
+not using its body properly to balance."
+
+ROOT CAUSE: STATIC LOCK-DOWN STRATEGY
+────────────────────────────────────────────────────────────────────────────────
+
+After session 4 correctly removed the inverted-kernel "reward chaos" bug,
+the policy converged to the EXACT OPPOSITE failure: every joint locked
+near HOME, no dynamic motion at all. The reason is that the session-4 fix
+left ALL THREE gradients that would encourage dynamic balance suppressed
+by competing penalties:
+
+  1. pose (weight 2, uniform std=0.25): pulls knees back to HOME (0.3 rad).
+     Any knee flexion past ≈0.45 rad collapses the pose kernel. Stepping
+     and squatting corrections require knee bend → punished.
+
+  2. hold_still (weight 2, std=0.5): penalises pelvis lin+ang velocity.
+     A 0.5 m/s stepping motion costs ≈1.3/step (kernel drops 1.0 → 0.37).
+     Stepping is mechanically required but rewarded as failure.
+
+  3. feet_bearing_weight (bodyweight_n=225 N): full-bodyweight target means
+     lifting one foot to step drops force from 225 N → 112 N, reward from
+     0.76 → 0.46 (×5 weight = 1.5/step loss). Single-foot stance is taxed.
+
+  4. angular_momentum (-0.5, std=1.0): whole-body angmom penalty saturates
+     at ≈1 kg·m²/s which is exactly the momentum of ONE SWINGING LEG. The
+     penalty fires full-strength against legitimate corrective steps.
+
+  5. Action scale ×0.25 + init_std=0.3: per-step random knee/hip exploration
+     is ≈0.026 rad. A real step needs ≈0.3 rad of knee flexion. Random walk
+     over a 24-step rollout only reaches ≈0.13 rad — below the threshold
+     where stepping ever appears as an exploration sample. PPO never sees a
+     successful step in its replay → value function never learns stepping
+     is valuable → policy never moves toward stepping.
+
+The session-4 fix correctly took away the chaos-reward bug, but with all
+five constraints above still active the policy had nowhere to GO except
+"output zero, lock all joints". It correctly maximised what was left of
+the reward by being completely rigid, then collapsed every time the
+terrain curriculum promoted it past what static stiffness could handle.
+
+FIXES APPLIED (session 5):
+────────────────────────────────────────────────────────────────────────────────
+
+File: vsls:/src/mjlab/tasks/standup/config/g1/env_cfgs.py
+  1. PER-JOINT POSE STD PARTITION. Replaced {".*": 0.25} with:
+       arms (shoulder/elbow/wrist):  0.15  (tight — no arm flailing)
+       waist (yaw/pitch/roll):       0.10  (very tight — no waist cheats)
+       hip_pitch:                    0.5   (loose — stepping)
+       hip_roll:                     0.4   (moderate — lateral)
+       hip_yaw:                      0.2   (tight — no twisting)
+       knee:                         0.6   (very loose — full bend range)
+       ankle_pitch:                  0.4   (moderate)
+       ankle_roll:                   0.3   (limited joint range ±0.26)
+     Legs effectively unconstrained by pose; task-level rewards (upright_gated,
+     base_height, feet_bearing_weight) do the work of pulling them toward
+     standing posture. Upper-body cheats (arm flailing, waist bending) stay
+     suppressed.
+
+  2. hold_still weight: 2.0 → 0.5. Stepping cost drops from ≈1.3/step to
+     ≈0.3/step. Still prefers stillness when no push present, but no longer
+     out-weighs the long-term benefit of a corrective step.
+
+  3. feet_bearing_weight bodyweight_n: 225 → 112.5 (half-bodyweight). Now:
+       both feet stance:  225 N → tanh(2.0) ≈ 0.96 × 5 ≈ 4.8
+       one foot stance:   112 N → tanh(1.0) ≈ 0.76 × 5 ≈ 3.8
+       airborne:            0 N → 0
+     Stepping no longer costs reward; only true leg-abandonment collapses
+     the term. Same half-bodyweight threshold as upright_gated for consistency.
+
+  4. angular_momentum std: 1.0 → 2.0. Saturates at 2 kg·m²/s instead of 1,
+     so a single swinging leg (≈0.75 kg·m²/s) only triggers kernel=0.13
+     (1 - exp(-0.14)) → penalty ≈ -0.065/step, vs the old ≈-0.22/step that
+     was taxing every corrective step. body_ang_vel std unchanged — it tracks
+     torso pitch/roll only, which leg swings do not affect.
+
+  5. ACTION SCALE on legs:
+       hip_pitch:  ×0.25 → ×0.5
+       knee:       ×0.25 → ×0.5
+       (ankles were already ×0.5 from session 4)
+     Per-step random exploration on the joints that matter for stepping is
+     now ≈0.04 rad (with init_std=0.4), so a 24-step rollout random-walks
+     ≈0.2 rad of leg flexion — enough to discover stepping during
+     exploration. Arms / waist / hip_yaw / hip_roll stay at ×0.25 (no large
+     excursions needed; tight scale also suppresses lateral wobble).
+
+File: vsls:/src/mjlab/tasks/standup/config/g1/rl_cfg.py
+  6. init_std: 0.3 → 0.4. Combined with the leg action scale increase,
+     gives ≈0.07 rad/step exploration on knee/hip_pitch (was ≈0.026).
+     learn_std remains False (do NOT re-enable; the std-growth feedback
+     loop documented in section 5 will recur).
+
+WHY THIS SHOULD UNSTICK THE POLICY:
+  - With pose effectively off the legs, the only gradient on the leg joints
+    comes from the task itself: keep pelvis upright, keep feet on ground,
+    keep base at standing height. These rewards do NOT pull joints toward
+    HOME — they pull the pelvis toward standing, which the legs achieve by
+    whatever joint configuration is mechanically appropriate (including
+    bent knees, asymmetric hip angles, stepping mid-recovery).
+  - With hold_still soft and feet_bearing half-bodyweight, stepping is no
+    longer net-negative reward. The policy can sample a step during random
+    exploration, value-function attribution learns that the step prevented
+    a fall, and PPO reinforces that strategy.
+  - With angular_momentum saturating later, a single swinging leg incurs
+    only ~5% of its previous penalty; body_ang_vel (torso-only) still taxes
+    rotation-based cheats at full strength.
+  - With wider exploration (init_std=0.4) and larger leg action scale,
+    stepping-range knee/hip motions actually appear in the rollout buffer
+    instead of being statistically unreachable.
+
+EXPECTED CHARTS:
+  - Train/mean_reward: should stop declining; may dip briefly during early
+    exploration (more dynamic motion → higher initial cost) then climb as
+    stepping is discovered and reinforced.
+  - Episode_Reward/feet_bearing: should rise (tanh saturates earlier).
+  - Episode_Reward/pose: may DROP relative to before (leg joints now move
+    freely without contributing to kernel collapse); this is intentional
+    — the absolute reduction is small (~0.2/step) and the gain from leg
+    use should dominate.
+  - Episode_Reward/upright_gated: should rise as the policy uses legs
+    to keep the pelvis upright under perturbations instead of falling.
+  - Episode_Reward/hold_still: will drop in absolute terms (weight halved
+    AND more base motion); not a failure signal.
+  - Visual: robot should demonstrate visible knee bending and occasional
+    stepping during pushes, instead of the previous arms-and-feet-only
+    locked-stiff balance.
+
+WHAT TO TRY NEXT IF STILL STUCK:
+  1. Push strength escalation: bump push_robot velocity_range to ±0.6 m/s
+     to force genuinely large recovery motions. Current ±0.3 m/s is small
+     enough for stiffness alone to handle.
+  2. Reset velocity escalation: bump reset_base velocity_range to ±0.4 m/s
+     so the robot starts each episode mid-perturbation, removing the
+     "stand still works" easy default at t=0.
+  3. Disable angular_momentum entirely (weight 0). It was disabled
+     through session 3 and still useful then; if the leg-swing penalty
+     is too restrictive even at std=2.0, removing it isolates whether
+     body_ang_vel alone is sufficient to suppress torso swinging.
+  4. Add an explicit "swing leg height" reward: small positive weight on
+     the maximum foot height across the two feet (encourages occasional
+     foot lift, helps bootstrap the stepping reflex).
 
 ================================================================================

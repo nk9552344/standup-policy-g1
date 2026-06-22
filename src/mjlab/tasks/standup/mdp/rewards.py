@@ -88,6 +88,33 @@ def hold_still(
   return torch.exp(-vel_error / std**2)
 
 
+def base_height_reward(
+  env: ManagerBasedRlEnv,
+  target_height: float,
+  std: float,
+  asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+  """Reward the pelvis being at standing height.
+
+  Returns exp(-((height - target_height) / std)²): 1.0 at exactly target_height,
+  decaying symmetrically below and above. For stay-stand this fills the gap
+  between the fell_over termination threshold (0.45 m) and the actual standing
+  height (~0.72 m): without this reward a policy can earn full upright_gated
+  score while slowly squatting downward, since upright orientation alone does
+  not penalise downward displacement.
+
+  target_height: desired pelvis z in metres. HOME_KEYFRAME with bent knees
+    gives an actual pelvis height of ~0.72 m (not 0.783 m which is the raw
+    MJCF spawn z). Override per-robot.
+  std: kernel width in metres. 0.10 m gives exp(-1)≈0.37 when 10 cm below
+    target and approaches 0 near the 0.45 m fell_over floor.
+  """
+  asset: Entity = env.scene[asset_cfg.name]
+  height = asset.data.root_link_pos_w[:, 2]  # [B] world-frame pelvis z
+  error = height - target_height             # [B]
+  return torch.exp(-(error**2) / std**2)
+
+
 class upright:
   """Reward for keeping the base upright.
 
@@ -213,31 +240,35 @@ def body_angular_velocity_penalty(
 ) -> torch.Tensor:
   """Penalize excessive body angular velocities with a bounded exp kernel.
 
-  In the recovery policy this used raw squared magnitude and was disabled
-  (weight=0) because tumbling produced angular velocities of ~50-100 rad/s,
-  making the penalty -250 to -1000 per step and destabilising the value
-  function. In stay-stand there is no tumbling phase, so we can re-enable
-  it. However, we still use exp(-x²/std²) rather than raw squared magnitude:
-    - Bounded in [0, 1] -- the penalty can never blow up the value function
-      no matter how chaotic the state after a hard push.
-    - Still provides a strong gradient near zero (small angular velocities
-      near std matter just as much as large ones).
+  Returns penalty intensity in [0, 1]: 0 at rest and saturating to 1 at high
+  angular velocity, computed as ``1 - exp(-xy²/std²)``. Combined with the
+  negative weight in env cfg, this gives a real penalty that grows with
+  motion and is bounded so it can't blow up the value function.
+
+  HISTORY: the previous implementation returned ``exp(-xy²/std²)`` (highest
+  at zero, lowest at chaos). Combined with a negative weight, that
+  *rewarded* high angular velocity (cost was largest when still, zero when
+  spinning), which actively trained the torso-swinging balance strategy
+  this term was meant to suppress. Every other ``exp(-x²/std²)`` reward in
+  this file (upright, pose, hold_still, base_height, upright_gated) uses a
+  positive weight because that kernel shape is a stability *reward*, not a
+  penalty. Fixed by flipping the kernel here and in angular_momentum_penalty.
 
   Only roll and pitch (xy) are penalized; yaw rotation is a separate concern
   (the robot should be able to yaw to settle, and yaw angular velocity alone
   doesn't indicate instability the same way pitch/roll does).
 
-  std: characteristic angular velocity (rad/s) at which the reward falls to
-  exp(-1) ≈ 0.37. A value of ~1.0 rad/s is a reasonable starting point --
-  tighter than walking gait but loose enough not to penalize normal balance
-  corrections.
+  std: characteristic angular velocity (rad/s) at which the penalty reaches
+  ``1 - exp(-1) ≈ 0.63``. A value of ~1.0 rad/s is a reasonable starting
+  point -- tighter than walking gait but loose enough not to fully saturate
+  the penalty during normal balance corrections (which run at ~0.2-0.4 rad/s).
   """
   asset: Entity = env.scene[asset_cfg.name]
   ang_vel = asset.data.body_link_ang_vel_w[:, asset_cfg.body_ids, :]
   ang_vel = ang_vel.squeeze(1)
   ang_vel_xy = ang_vel[:, :2]  # Roll + pitch only.
   xy_sq = torch.sum(torch.square(ang_vel_xy), dim=1)
-  return torch.exp(-xy_sq / std**2)
+  return 1.0 - torch.exp(-xy_sq / std**2)
 
 
 def angular_momentum_penalty(
@@ -247,22 +278,129 @@ def angular_momentum_penalty(
 ) -> torch.Tensor:
   """Penalize whole-body angular momentum with a bounded exp kernel.
 
-  Same reasoning as body_angular_velocity_penalty: was disabled in recovery
-  because tumbling/flailing produced magnitudes that blew up the value
-  function. Now re-enabled with exp(-|L|²/std²) so the penalty is bounded
-  in [0, 1] regardless of what the policy does after a hard push.
+  Returns penalty intensity in [0, 1] computed as ``1 - exp(-|L|²/std²)``: 0
+  at rest and saturating to 1 at high angular momentum. Combined with the
+  negative weight in env cfg this is a bounded, correctly-oriented penalty.
 
-  std: characteristic angular momentum magnitude at which reward falls to
-  exp(-1) ≈ 0.37. Units depend on your robot's inertia tensor; start with
-  std ~1.0 and adjust based on typical standing angular momentum logged
-  during early training.
+  HISTORY: see body_angular_velocity_penalty -- the previous form
+  ``exp(-|L|²/std²)`` was used with a negative weight, which inverted the
+  intended cost (rewarding chaos, penalising stillness). Flipped to
+  ``1 - exp(...)`` so the function name and semantics match.
+
+  std: characteristic angular momentum magnitude at which the penalty
+  reaches ``1 - exp(-1) ≈ 0.63``. Units depend on the robot's inertia
+  tensor; start with std ~1.0 and adjust based on the
+  ``Metrics/angular_momentum_mean`` log during early training.
   """
   angmom_sensor: BuiltinSensor = env.scene[sensor_name]
   angmom = angmom_sensor.data
   angmom_magnitude_sq = torch.sum(torch.square(angmom), dim=-1)
   angmom_magnitude = torch.sqrt(angmom_magnitude_sq)
   env.extras["log"]["Metrics/angular_momentum_mean"] = torch.mean(angmom_magnitude)
-  return torch.exp(-angmom_magnitude_sq / std**2)
+  return 1.0 - torch.exp(-angmom_magnitude_sq / std**2)
+
+
+def feet_bearing_weight(
+  env: ManagerBasedRlEnv,
+  sensor_name: str,
+  bodyweight_n: float = 225.0,
+) -> torch.Tensor:
+  """Reward feet bearing the robot's weight through ground contact.
+
+  Reads the net ground-reaction force from a ContactSensor configured with
+  reduce="netforce" and two primaries (left and right foot subtrees). Returns
+  tanh((|F_left| + |F_right|) / bodyweight_n), which is:
+    - 0.0  when no foot touches the ground (legs fully abandoned)
+    - ~0.46 when only one foot bears bodyweight
+    - ~0.76 when both feet together bear full bodyweight
+
+  This directly incentivizes leg use: the robot must push through its legs
+  to generate ground reaction force. When the policy learns to balance using
+  only the upper body (the "arm-flapping" failure mode), foot forces drop to
+  zero and this reward collapses, opposing that local optimum.
+
+  The sensor must expose a ``force`` field with shape [B, 2, 3] (one net
+  force vector per foot, in world frame). For G1 with two primaries
+  (left_ankle_roll_link, right_ankle_roll_link) and reduce="netforce" this
+  is satisfied out-of-the-box.
+
+  bodyweight_n: normalisation constant in Newtons. Set to robot_mass * 9.8.
+    For G1 (~23 kg): 225 N. tanh saturates near 1.0 at 2× bodyweight.
+  """
+  sensor: ContactSensor = env.scene[sensor_name]
+  data = sensor.data
+  assert data.force is not None, (
+    "feet_bearing_weight requires the contact sensor to have fields=('force', ...)"
+  )
+  # data.force: [B, 2, 3] — left foot at index 0, right foot at index 1.
+  force_left = torch.norm(data.force[:, 0, :], dim=-1)   # [B]
+  force_right = torch.norm(data.force[:, 1, :], dim=-1)  # [B]
+  total_force = force_left + force_right                  # [B]
+  return torch.tanh(total_force / bodyweight_n)
+
+
+def upright_with_feet_gate(
+  env: ManagerBasedRlEnv,
+  std: float,
+  sensor_name: str,
+  bodyweight_n: float = 225.0,
+  asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+  """Upright reward gated by ground-reaction force — the primary balance signal.
+
+  Returns upright_score × feet_gate where:
+    upright_score = exp(-xy²/std²) ∈ [0, 1]   (1.0 when perfectly vertical)
+    feet_gate     = clamp(force / bodyweight_n, 0, 1) ∈ [0, 1]
+                    (1.0 when both feet bear full bodyweight, 0.0 when airborne)
+
+  The gate makes it IMPOSSIBLE to earn the primary balance reward without
+  bearing weight through the feet. This prevents the "arm-only balance"
+  failure mode (~1500 iters) where the policy earns full upright reward by
+  flapping arms while freezing legs, because:
+    - arm-only balance:  feet leave ground → gate → 0 → reward → 0
+    - proper balance:    feet bear weight  → gate → 1 → reward = upright_score
+
+  The feet_gate uses a linear clamp (not tanh) so it reaches exactly 1.0 at
+  bodyweight_n Newtons total force, giving a clear full-reward target for the
+  policy to aim at.
+
+  asset_cfg: body_names=() (root link = pelvis) for G1. Do NOT set this to
+    "torso_link" — torso tracking allows the waist-bending compensation local
+    optimum (torso stays vertical by bending the waist while the pelvis falls,
+    earning full upright reward without any leg corrections). body_names=()
+    → asset_cfg.body_ids is falsy → uses root_link_quat_w (pelvis).
+    Set per-robot.
+  sensor_name: ContactSensor with reduce="netforce" and two primaries (left
+    and right foot subtrees). data.force shape must be [B, 2, 3].
+  bodyweight_n: Normalisation constant in Newtons (robot_mass × 9.8).
+    Gate = 1.0 at this force. For G1 (~23 kg): 225 N. Use half-bodyweight
+    (112.5 N) if stepping should not be penalised (gate=1 when one foot
+    bears full load).
+  """
+  # --- Uprightness component ---
+  asset: Entity = env.scene[asset_cfg.name]
+  if asset_cfg.body_ids:
+    body_quat_w = asset.data.body_link_quat_w[:, asset_cfg.body_ids, :]  # [B, 1, 4]
+    body_quat_w = body_quat_w.squeeze(1)  # [B, 4]
+  else:
+    body_quat_w = asset.data.root_link_quat_w  # [B, 4]
+  gravity_w = asset.data.gravity_vec_w  # [3]
+  projected_gravity_b = quat_apply_inverse(body_quat_w, gravity_w)  # [B, 3]
+  xy_sq = torch.sum(torch.square(projected_gravity_b[:, :2]), dim=1)  # [B]
+  upright_score = torch.exp(-xy_sq / std**2)  # [B], in [0, 1]
+
+  # --- Foot-contact gate ---
+  sensor: ContactSensor = env.scene[sensor_name]
+  data = sensor.data
+  assert data.force is not None, (
+    "upright_with_feet_gate requires the contact sensor to have fields=('force', ...)"
+  )
+  # data.force: [B, 2, 3] — left foot at index 0, right foot at index 1.
+  force_left = torch.norm(data.force[:, 0, :], dim=-1)   # [B]
+  force_right = torch.norm(data.force[:, 1, :], dim=-1)  # [B]
+  feet_gate = torch.clamp((force_left + force_right) / bodyweight_n, 0.0, 1.0)  # [B]
+
+  return upright_score * feet_gate
 
 
 class variable_posture:
@@ -311,3 +449,81 @@ class variable_posture:
     error_squared = torch.square(current_joint_pos - desired_joint_pos)
 
     return torch.exp(-torch.mean(error_squared / (self.std**2), dim=1))
+
+
+class ankle_corrective:
+  """Directly reward ankle_pitch joints being in the corrective direction for pelvis tilt.
+
+  ROOT CAUSE addressed: hip joint corrections change pelvis orientation in ONE
+  step (feet fixed → hip flex → pelvis tilts → upright_gated improves), while
+  ankle corrections require 3–5 physics steps via CoP shift → GRF change →
+  pelvis acceleration. PPO correctly prefers the faster signal (hip strategy).
+  No amount of upright_gated tuning fixes this timing asymmetry.
+
+  This reward fires IN THE SAME STEP that the ankle moves, giving the policy
+  immediate dense gradient for ankle corrections BEFORE the physics delay:
+
+    Forward tilt  (projected_gravity_b[0] > 0):
+      correct ankle response = dorsiflexion (ankle_pitch < HOME = −0.2 rad)
+      reward is positive when −tilt × (ankle − HOME) > 0  ✓
+
+    Backward tilt (projected_gravity_b[0] < 0):
+      correct ankle response = plantarflexion (ankle_pitch > HOME)
+      reward is positive when −tilt × (ankle − HOME) > 0  ✓
+
+    Upright (tilt ≈ 0): reward ≈ 0; no incentive to move ankles needlessly ✓
+    Wrong direction (ankle dorsiflexed while tilting backward): reward = 0
+      (clamped, not penalised — the falling upright_gated provides enough
+      negative signal already)
+
+  reward = clamp(−tilt_x × mean(ankle_pitch − HOME_ankle) / std, 0, 1)
+
+  Both lateral tilt (projected_gravity_b[1]) and ankle_roll are included
+  with the same formula to also incentivise lateral ankle corrections.
+
+  std: typical product magnitude at which reward saturates to 1.0.
+    ≈ tilt_at_operating_range × typical_ankle_deviation.
+    At 10° tilt (tilt_x ≈ 0.17) and 0.15 rad ankle correction:
+      product = 0.17 × 0.15 = 0.026 → reward = clamp(0.026/0.025, 0, 1) ≈ 1
+    Use std ≈ 0.025.
+  """
+
+  def __init__(self, cfg: RewardTermCfg, env: ManagerBasedRlEnv) -> None:
+    asset: Entity = env.scene[cfg.params["asset_cfg"].name]
+    # Find ankle pitch and roll joint indices.
+    self._pitch_ids, _ = asset.find_joints([".*_ankle_pitch_joint"])
+    self._roll_ids, _ = asset.find_joints([".*_ankle_roll_joint"])
+    default_pos = asset.data.default_joint_pos
+    assert default_pos is not None
+    self._home_pitch = default_pos[:, self._pitch_ids]  # [B, 2]
+    self._home_roll = default_pos[:, self._roll_ids]    # [B, 2]
+
+  def __call__(
+    self,
+    env: ManagerBasedRlEnv,
+    std: float,
+    asset_cfg: SceneEntityCfg,
+  ) -> torch.Tensor:
+    del asset_cfg  # joint ids cached in __init__
+    asset: Entity = env.scene["robot"]
+
+    # Forward (x) and lateral (y) tilt in pelvis body frame.
+    gravity_b = asset.data.projected_gravity_b  # [B, 3]
+    tilt_x = gravity_b[:, 0]  # [B], positive = forward tilt
+    tilt_y = gravity_b[:, 1]  # [B], positive = rightward tilt
+
+    # Ankle deviations from HOME.
+    ankle_pitch = asset.data.joint_pos[:, self._pitch_ids]  # [B, 2]
+    ankle_roll = asset.data.joint_pos[:, self._roll_ids]    # [B, 2]
+    dev_pitch = (ankle_pitch - self._home_pitch).mean(dim=1)  # [B]
+    dev_roll = (ankle_roll - self._home_roll).mean(dim=1)     # [B]
+
+    # Corrective alignment score: positive when ankle is in the right place.
+    # Forward tilt → dorsiflexion (dev_pitch < 0) → −tilt_x × dev_pitch > 0 ✓
+    # Rightward tilt → ankle_roll correction (dev_roll < 0 for right ankle) ✓
+    corrective = (-tilt_x * dev_pitch + -tilt_y * dev_roll) * 0.5  # [B]
+
+    return torch.clamp(corrective / std, 0.0, 1.0)
+
+  def reset(self, env_ids: torch.Tensor) -> None:
+    del env_ids
