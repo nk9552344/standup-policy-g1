@@ -8,7 +8,6 @@ import math
 
 from mjlab.envs import ManagerBasedRlEnvCfg
 from mjlab.envs import mdp
-from mjlab.envs.mdp import dr
 from mjlab.envs.mdp.actions import JointPositionActionCfg
 from mjlab.managers.action_manager import ActionTermCfg
 from mjlab.managers.event_manager import EventTermCfg
@@ -107,54 +106,6 @@ def make_stay_stand_env_cfg() -> ManagerBasedRlEnvCfg:
         "asset_cfg": SceneEntityCfg("robot", joint_names=(".*",)),
       },
     ),
-    # Pushes are soft and infrequent: they teach robustness but don't dominate
-    # the early reward signal while the policy is still learning to stand.
-    "push_robot": EventTermCfg(
-      func=mdp.push_by_setting_velocity,
-      mode="interval",
-      interval_range_s=(8.0, 12.0),
-      params={
-        "velocity_range": {
-          "x": (-0.2, 0.2),
-          "y": (-0.2, 0.2),
-          "z": (-0.1, 0.1),
-          "roll": (-0.15, 0.15),
-          "pitch": (-0.15, 0.15),
-          "yaw": (-0.25, 0.25),
-        },
-      },
-    ),
-    "foot_friction": EventTermCfg(
-      mode="startup",
-      func=dr.geom_friction,
-      params={
-        "asset_cfg": SceneEntityCfg("robot", geom_names=()),  # Set per-robot.
-        "operation": "abs",
-        "ranges": (0.3, 1.2),
-        "shared_random": True,
-      },
-    ),
-    "encoder_bias": EventTermCfg(
-      mode="startup",
-      func=dr.encoder_bias,
-      params={
-        "asset_cfg": SceneEntityCfg("robot"),
-        "bias_range": (-0.015, 0.015),
-      },
-    ),
-    "base_com": EventTermCfg(
-      mode="startup",
-      func=dr.body_com_offset,
-      params={
-        "asset_cfg": SceneEntityCfg("robot", body_names=()),  # Set per-robot.
-        "operation": "add",
-        "ranges": {
-          0: (-0.025, 0.025),
-          1: (-0.025, 0.025),
-          2: (-0.03, 0.03),
-        },
-      },
-    ),
   }
 
   ##
@@ -162,25 +113,20 @@ def make_stay_stand_env_cfg() -> ManagerBasedRlEnvCfg:
   ##
 
   rewards = {
-    # Large alive bonus so the policy is incentivized to NOT trigger fell_over.
-    "alive": RewardTermCfg(func=mdp.is_alive, weight=2.0),
-    # Main positive signal. posture returns exp(-mean(error**2/std**2)) which
-    # collapses to ~0 when std is small relative to the error. Default std is
-    # intentionally loose; tighten per-robot once the policy converges.
+    # Dominant survival signal: stay alive => gain reward every step.
+    "alive": RewardTermCfg(func=mdp.is_alive, weight=3.0),
+    # Stay near default joint pose. exp(-mean(error**2/std**2)); std loose enough
+    # that the reward is meaningfully positive during exploration.
     "posture": RewardTermCfg(
       func=mdp.posture,
-      weight=3.0,
+      weight=5.0,
       params={
         "asset_cfg": SceneEntityCfg("robot", joint_names=(".*",)),
-        "std": {".*": 0.3},  # Override per-robot.
+        "std": {".*": 0.4},  # Override per-robot.
       },
     ),
-    # Penalize tilt from world up: ||projected_gravity_xy||^2.
-    "upright": RewardTermCfg(func=mdp.flat_orientation_l2, weight=-1.0),
-    "joint_vel_l2": RewardTermCfg(func=mdp.joint_vel_l2, weight=-1e-3),
-    "joint_acc_l2": RewardTermCfg(func=mdp.joint_acc_l2, weight=-1e-7),
-    "action_rate_l2": RewardTermCfg(func=mdp.action_rate_l2, weight=-5e-3),
-    "dof_pos_limits": RewardTermCfg(func=mdp.joint_pos_limits, weight=-0.5),
+    # Strong direct gradient pulling torso back to vertical when tilted.
+    "upright": RewardTermCfg(func=mdp.flat_orientation_l2, weight=-3.0),
   }
 
   ##
