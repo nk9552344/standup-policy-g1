@@ -60,13 +60,19 @@ def unitree_g1_ppo_runner_cfg() -> RslRlOnPolicyRunnerCfg:
         # ~0.1 rad per joint exploration noise -- enough to discover the
         # standup gradient without making the robot vibrate so much it
         # can't earn the still-standing rewards.
-        # init_std=0.3 gives wider exploration (~0.3 rad per joint at init)
-        # to help the policy discover the standing attractor from random
-        # starts without relying on std growth. learn_std=False keeps std
-        # fixed throughout training -- see the long comment above for why
-        # learn_std=True causes the exact std-growth feedback loop we are
-        # trying to avoid.
-        "init_std": 0.3,
+        # init_std=0.4 (session 5: bumped from 0.3) gives wider exploration
+        # to help the policy discover DYNAMIC balance strategies (stepping,
+        # knee flexion, hip swing) rather than only static lock-down. With
+        # the leg action_scale bumped to ×0.5 in env_cfgs.py, per-step random
+        # exploration on knee/hip_pitch is now ≈0.07 rad/step, so a 24-step
+        # rollout random-walks ≈0.34 rad of leg motion -- enough to actually
+        # sample stepping and corrective squats during exploration. Earlier
+        # init_std=0.3 × small leg scale gave only ≈0.13 rad over a rollout,
+        # below the threshold where stepping ever appeared in random samples.
+        # learn_std=False keeps std fixed throughout training -- see the
+        # long comment above for why learn_std=True causes the exact
+        # std-growth feedback loop we are trying to avoid.
+        "init_std": 0.4,
         "std_type": "scalar",
         "learn_std": False,
       },

@@ -163,18 +163,29 @@ def unitree_g1_rough_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   # back up once the policy can reliably hold default pose, since harder
   # curriculum stages (recovery from prone) need larger action ranges.
   joint_pos_action.scale = {k: v * 0.25 for k, v in G1_ACTION_SCALE.items()}
-  # ANKLE SCALE INCREASE: ankle corrections are mechanically the correct
-  # strategy for balance but are under-powered at \u00d70.25. G1_ACTION_SCALE
-  # is effort/stiffness-based; ankle kp\u224840 N\u00b7m/rad gives scale\u22480.078 rad/unit
-  # at \u00d70.25, meaning ±0.023 rad random exploration at init_std=0.3 -- barely
-  # detectable. Doubling to \u00d70.5 gives \u00b10.047 rad exploration and max correction
-  # \u22480.47 rad (within joint limits). This makes ankle corrections discoverable
-  # during random exploration without destabilising static balance.
+  # LEG SCALE INCREASE for the joints that actually do balance work.
+  # G1_ACTION_SCALE is effort/stiffness based; at the global ×0.25 multiplier
+  # the per-step random exploration on knee/hip_pitch is ≈0.026 rad
+  # (init_std=0.4 × 0.25 × ≈0.35 rad/unit), so the random walk over a 24-step
+  # rollout reaches only ≈0.13 rad of leg flexion -- far below the ≈0.3 rad
+  # of knee bend a real corrective step requires. The policy therefore never
+  # samples a successful step during exploration, never sees the value of a
+  # step, and collapses to "output zero". Bumping ankle, hip_pitch and knee
+  # to ×0.5 doubles per-step exploration and lets a multi-step random walk
+  # cover the ±0.3 rad range needed for stepping/squatting corrections.
+  # Arms, waist, hip_yaw, hip_roll stay at ×0.25 (no need for large excursions;
+  # tight scale keeps upper-body cheats and lateral leg wobble suppressed).
   joint_pos_action.scale[".*_ankle_pitch_joint"] = (
     G1_ACTION_SCALE[".*_ankle_pitch_joint"] * 0.5
   )
   joint_pos_action.scale[".*_ankle_roll_joint"] = (
     G1_ACTION_SCALE[".*_ankle_roll_joint"] * 0.5
+  )
+  joint_pos_action.scale[".*_hip_pitch_joint"] = (
+    G1_ACTION_SCALE[".*_hip_pitch_joint"] * 0.5
+  )
+  joint_pos_action.scale[".*_knee_joint"] = (
+    G1_ACTION_SCALE[".*_knee_joint"] * 0.5
   )
 
   cfg.viewer.body_name = "torso_link"
@@ -189,16 +200,47 @@ def unitree_g1_rough_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   cfg.events["foot_friction"].params["asset_cfg"].geom_names = geom_names
   cfg.events["base_com"].params["asset_cfg"].body_names = ("torso_link",)
 
-  # POSE STD UNIFORM: Tight std=0.25 for all joints stabilises early training
-  # by keeping the policy near HOME before the value function converges.
-  # The gated upright reward (upright_gated) provides a stronger gradient for
-  # corrective leg movements than any pose std relaxation could, because the
-  # gate turns off the entire 10-unit upright signal when feet leave the ground
-  # -- this overwhelms the 2-unit pose gradient opposing leg corrections.
-  # Loose leg std (tried previously) removed the stabilising pose gradient
-  # for legs, causing random policy perturbations to destabilise the robot
-  # immediately (fell_over=1.0 from iter 0).
-  cfg.rewards["pose"].params["std_values"] = {".*": 0.25}
+  # POSE STD PER-JOINT PARTITION (session 5 fix).
+  # The previous uniform std=0.25 was killing dynamic balance: any knee
+  # flexion past ≈0.45 rad and any hip swing past ≈0.45 rad collapsed the
+  # pose kernel, so the policy converged to "lock all joints near HOME".
+  # The robot ended up using only static stiffness to balance and never
+  # learned stepping or knee-flexion corrections.
+  #
+  # New scheme: keep arms and waist tight (suppresses arm-flailing and
+  # waist-bending balance cheats that previously emerged), but allow legs
+  # to move freely. Knee std=0.6 makes a full ±0.5 rad squat barely affect
+  # the kernel; hip_pitch std=0.5 allows full stepping range. The
+  # task-level rewards (upright_gated, base_height, feet_bearing_weight,
+  # ankle_corrective) provide the actual "return to standing pose" signal
+  # for legs -- much stronger and more correctly oriented than a pose
+  # attractor toward HOME could be.
+  cfg.rewards["pose"].params["std_values"] = {
+    # Arms: tight -- arm flailing should never be a balance strategy.
+    ".*_shoulder_pitch_joint": 0.15,
+    ".*_shoulder_roll_joint": 0.15,
+    ".*_shoulder_yaw_joint": 0.15,
+    ".*_elbow_joint": 0.15,
+    ".*_wrist_roll_joint": 0.15,
+    ".*_wrist_pitch_joint": 0.15,
+    ".*_wrist_yaw_joint": 0.15,
+    # Waist: very tight -- waist-bending is the "upper-body compensation"
+    # cheat that lets the torso stay vertical while the pelvis falls.
+    "waist_yaw_joint": 0.10,
+    "waist_pitch_joint": 0.10,
+    "waist_roll_joint": 0.10,
+    # Hips: loose on pitch (stepping), moderate on roll (lateral), tight
+    # on yaw (don't want legs twisting in/out for no reason).
+    ".*_hip_pitch_joint": 0.5,
+    ".*_hip_roll_joint": 0.4,
+    ".*_hip_yaw_joint": 0.2,
+    # Knees: very loose -- full bend range is a legitimate balance tool.
+    ".*_knee_joint": 0.6,
+    # Ankles: moderate -- corrections needed, but joint range itself is
+    # narrow (±0.26 rad on roll, ±0.87/0.52 on pitch).
+    ".*_ankle_pitch_joint": 0.4,
+    ".*_ankle_roll_joint": 0.3,
+  }
 
   cfg.rewards["upright"].params["asset_cfg"].body_names = ("torso_link",)
   cfg.rewards["body_ang_vel"].params["asset_cfg"].body_names = ("torso_link",)
@@ -283,11 +325,29 @@ def unitree_g1_rough_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   #     mean_action_acc=6.5 chaos pattern earlier in training was largely
   #     driven by the same torso-swing strategy, so fixing the angular-velocity
   #     penalties should reduce action chaos as a side effect.
+  #
+  # SESSION 5 TUNING: angular_momentum.std bumped 1.0 -> 2.0. The old std=1.0
+  # saturated at ≈1 kg·m²/s which is roughly the angular momentum of ONE
+  # SWINGING LEG during a corrective step. That meant the penalty fired
+  # full-strength against legitimate stepping motions, not just torso swings.
+  # body_ang_vel std unchanged because it only tracks TORSO link pitch/roll
+  # angular velocity -- legs swinging do not rotate the torso, so it does not
+  # need to be loosened to permit stepping.
   cfg.rewards["body_ang_vel"].params["std"] = 1.0
   cfg.rewards["body_ang_vel"].weight = -0.5
-  cfg.rewards["angular_momentum"].params["std"] = 1.0
+  cfg.rewards["angular_momentum"].params["std"] = 2.0
   cfg.rewards["angular_momentum"].weight = -0.5
   cfg.rewards["action_rate_l2"].weight = -0.01
+
+  # SESSION 5: hold_still weight 2.0 -> 0.5. hold_still penalises pelvis
+  # linear+angular velocity -- exactly what stepping motions produce. At
+  # weight 2.0 a corrective 0.5 m/s step cost ≈1.3/step (kernel drops from
+  # 1.0 to 0.37), which over a 5-step stepping window outweighed the value
+  # of avoiding a small push. At 0.5 the cost is ≈0.3/step, soft enough to
+  # not block stepping but still preferring stillness when no push is
+  # present. upright_gated + base_height + pose still pin the robot to its
+  # initial position when nothing is disturbing it.
+  cfg.rewards["hold_still"].weight = 0.5
 
   # G1 standing height overrides -- terrain curriculum and fell_over
   # termination both use the same "is standing" threshold.
@@ -320,14 +380,21 @@ def unitree_g1_rough_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   cfg.rewards["self_collision"].weight = -0.2
 
   # FEET BEARING WEIGHT: reward ground-reaction force through feet.
-  # When both feet are properly planted, total force ≈ bodyweight (225 N for
-  # G1 ~23 kg), giving tanh(1) ≈ 0.76 per step × weight=5 ≈ 3.8.
   # When the robot abandons legs for arm-only balance, foot forces drop to 0
   # and this reward collapses, directly opposing that failure mode.
   # The feet_ground_contact sensor exposes two primaries (left and right
   # ankle subtrees) with reduce="netforce", so data.force is [B, 2, 3].
+  #
+  # SESSION 5: bodyweight_n 225 -> 112.5 (half-bodyweight). At 225 N
+  # (full bodyweight), tanh(force/225) gives 0.76 when both feet bear full
+  # bodyweight but only 0.46 when one foot lifts to step (single-foot stance
+  # at 112 N). That ≈0.3/step drop × weight=5 = 1.5/step penalty on stepping
+  # was actively training the policy NOT to step. At 112.5 N, tanh saturates
+  # near 1.0 for both-feet stance (~0.96) AND for single-foot stance bearing
+  # full bodyweight (~0.76), so stepping no longer costs reward. Only true
+  # leg-abandonment (both feet airborne) collapses the term.
   cfg.rewards["feet_bearing_weight"].params["sensor_name"] = feet_ground_cfg.name
-  cfg.rewards["feet_bearing_weight"].params["bodyweight_n"] = 225.0  # ~23 kg × 9.8
+  cfg.rewards["feet_bearing_weight"].params["bodyweight_n"] = 112.5  # half-bodyweight
   cfg.rewards["feet_bearing_weight"].weight = 5.0
   # ANKLE CORRECTIVE: direct, same-step reward for ankle_pitch/roll joints
   # being in the corrective direction for the current pelvis tilt.
