@@ -441,3 +441,81 @@ class variable_posture:
     error_squared = torch.square(current_joint_pos - desired_joint_pos)
 
     return torch.exp(-torch.mean(error_squared / (self.std**2), dim=1))
+
+
+class ankle_corrective:
+  """Directly reward ankle_pitch joints being in the corrective direction for pelvis tilt.
+
+  ROOT CAUSE addressed: hip joint corrections change pelvis orientation in ONE
+  step (feet fixed → hip flex → pelvis tilts → upright_gated improves), while
+  ankle corrections require 3–5 physics steps via CoP shift → GRF change →
+  pelvis acceleration. PPO correctly prefers the faster signal (hip strategy).
+  No amount of upright_gated tuning fixes this timing asymmetry.
+
+  This reward fires IN THE SAME STEP that the ankle moves, giving the policy
+  immediate dense gradient for ankle corrections BEFORE the physics delay:
+
+    Forward tilt  (projected_gravity_b[0] > 0):
+      correct ankle response = dorsiflexion (ankle_pitch < HOME = −0.2 rad)
+      reward is positive when −tilt × (ankle − HOME) > 0  ✓
+
+    Backward tilt (projected_gravity_b[0] < 0):
+      correct ankle response = plantarflexion (ankle_pitch > HOME)
+      reward is positive when −tilt × (ankle − HOME) > 0  ✓
+
+    Upright (tilt ≈ 0): reward ≈ 0; no incentive to move ankles needlessly ✓
+    Wrong direction (ankle dorsiflexed while tilting backward): reward = 0
+      (clamped, not penalised — the falling upright_gated provides enough
+      negative signal already)
+
+  reward = clamp(−tilt_x × mean(ankle_pitch − HOME_ankle) / std, 0, 1)
+
+  Both lateral tilt (projected_gravity_b[1]) and ankle_roll are included
+  with the same formula to also incentivise lateral ankle corrections.
+
+  std: typical product magnitude at which reward saturates to 1.0.
+    ≈ tilt_at_operating_range × typical_ankle_deviation.
+    At 10° tilt (tilt_x ≈ 0.17) and 0.15 rad ankle correction:
+      product = 0.17 × 0.15 = 0.026 → reward = clamp(0.026/0.025, 0, 1) ≈ 1
+    Use std ≈ 0.025.
+  """
+
+  def __init__(self, cfg: RewardTermCfg, env: ManagerBasedRlEnv) -> None:
+    asset: Entity = env.scene[cfg.params["asset_cfg"].name]
+    # Find ankle pitch and roll joint indices.
+    self._pitch_ids, _ = asset.find_joints([".*_ankle_pitch_joint"])
+    self._roll_ids, _ = asset.find_joints([".*_ankle_roll_joint"])
+    default_pos = asset.data.default_joint_pos
+    assert default_pos is not None
+    self._home_pitch = default_pos[:, self._pitch_ids]  # [B, 2]
+    self._home_roll = default_pos[:, self._roll_ids]    # [B, 2]
+
+  def __call__(
+    self,
+    env: ManagerBasedRlEnv,
+    std: float,
+    asset_cfg: SceneEntityCfg,
+  ) -> torch.Tensor:
+    del asset_cfg  # joint ids cached in __init__
+    asset: Entity = env.scene["robot"]
+
+    # Forward (x) and lateral (y) tilt in pelvis body frame.
+    gravity_b = asset.data.projected_gravity_b  # [B, 3]
+    tilt_x = gravity_b[:, 0]  # [B], positive = forward tilt
+    tilt_y = gravity_b[:, 1]  # [B], positive = rightward tilt
+
+    # Ankle deviations from HOME.
+    ankle_pitch = asset.data.joint_pos[:, self._pitch_ids]  # [B, 2]
+    ankle_roll = asset.data.joint_pos[:, self._roll_ids]    # [B, 2]
+    dev_pitch = (ankle_pitch - self._home_pitch).mean(dim=1)  # [B]
+    dev_roll = (ankle_roll - self._home_roll).mean(dim=1)     # [B]
+
+    # Corrective alignment score: positive when ankle is in the right place.
+    # Forward tilt → dorsiflexion (dev_pitch < 0) → −tilt_x × dev_pitch > 0 ✓
+    # Rightward tilt → ankle_roll correction (dev_roll < 0 for right ankle) ✓
+    corrective = (-tilt_x * dev_pitch + -tilt_y * dev_roll) * 0.5  # [B]
+
+    return torch.clamp(corrective / std, 0.0, 1.0)
+
+  def reset(self, env_ids: torch.Tensor) -> None:
+    del env_ids

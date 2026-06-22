@@ -163,6 +163,19 @@ def unitree_g1_rough_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   # back up once the policy can reliably hold default pose, since harder
   # curriculum stages (recovery from prone) need larger action ranges.
   joint_pos_action.scale = {k: v * 0.25 for k, v in G1_ACTION_SCALE.items()}
+  # ANKLE SCALE INCREASE: ankle corrections are mechanically the correct
+  # strategy for balance but are under-powered at \u00d70.25. G1_ACTION_SCALE
+  # is effort/stiffness-based; ankle kp\u224840 N\u00b7m/rad gives scale\u22480.078 rad/unit
+  # at \u00d70.25, meaning ±0.023 rad random exploration at init_std=0.3 -- barely
+  # detectable. Doubling to \u00d70.5 gives \u00b10.047 rad exploration and max correction
+  # \u22480.47 rad (within joint limits). This makes ankle corrections discoverable
+  # during random exploration without destabilising static balance.
+  joint_pos_action.scale[".*_ankle_pitch_joint"] = (
+    G1_ACTION_SCALE[".*_ankle_pitch_joint"] * 0.5
+  )
+  joint_pos_action.scale[".*_ankle_roll_joint"] = (
+    G1_ACTION_SCALE[".*_ankle_roll_joint"] * 0.5
+  )
 
   cfg.viewer.body_name = "torso_link"
 
@@ -310,7 +323,21 @@ def unitree_g1_rough_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   cfg.rewards["feet_bearing_weight"].params["sensor_name"] = feet_ground_cfg.name
   cfg.rewards["feet_bearing_weight"].params["bodyweight_n"] = 225.0  # ~23 kg × 9.8
   cfg.rewards["feet_bearing_weight"].weight = 5.0
-
+  # ANKLE CORRECTIVE: direct, same-step reward for ankle_pitch/roll joints
+  # being in the corrective direction for the current pelvis tilt.
+  # WHY THIS FIXES THE HIP-STRATEGY PROBLEM:
+  #   Hip corrections show up in upright_gated in 1 step (direct kinematics).
+  #   Ankle corrections take 3-5 steps (CoP shift \u2192 GRF \u2192 pelvis acceleration).
+  #   PPO correctly prefers the faster signal, so it learns hips over ankles.
+  #   This reward fires in the SAME STEP as the ankle moves, breaking the
+  #   timing asymmetry: ankle in correct position now earns reward NOW,
+  #   regardless of whether the pelvis has had time to respond.
+  # SIGNAL: reward = clamp(-tilt_x \u00d7 mean(ankle_pitch - HOME) / std, 0, 1)
+  #   Forward tilt + dorsiflexion: positive \u2192 rewarded  \u2713
+  #   Standing + ankle at HOME: zero \u2192 no spurious incentive  \u2713
+  #   Wrong direction: zero (clamped, not penalised)  \u2713
+  cfg.rewards["ankle_corrective"].params["std"] = 0.025
+  cfg.rewards["ankle_corrective"].weight = 3.0
   # BASE HEIGHT REWARD: continuous height gradient from standing (0.72 m) down
   # to the fell_over floor (0.45 m). Without this, the robot can earn full
   # upright_gated while slowly squatting because pelvis orientation alone does

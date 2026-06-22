@@ -396,6 +396,16 @@ def make_standup_env_cfg() -> ManagerBasedRlEnvCfg:
         "std_values": {},  # Set per-robot.
       },
     ),
+    "ankle_corrective": RewardTermCfg(
+      func=mdp.ankle_corrective,
+      weight=0.0,  # Override per-robot.
+      params={
+        # std ≈ tilt_at_operating_range × typical_ankle_correction.
+        # At 10° tilt (0.17) × 0.15 rad ankle: product = 0.026. Use 0.025.
+        "std": 0.025,      # Override per-robot.
+        "asset_cfg": SceneEntityCfg("robot"),
+      },
+    ),
     "body_ang_vel": RewardTermCfg(
       func=mdp.body_angular_velocity_penalty,
       weight=0.0,  # Override per-robot.
