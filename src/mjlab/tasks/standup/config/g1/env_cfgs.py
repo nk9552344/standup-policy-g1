@@ -227,24 +227,48 @@ def unitree_g1_rough_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   cfg.rewards["upright_gated"].params["bodyweight_n"] = 112.5  # half-bodyweight
   cfg.rewards["upright_gated"].weight = 10.0
 
-  # Reward balance (per-step max when standing with both feet down):
-  #   upright_gated: 10.0 × 1.0 × 1.0 = 10.0  (PRIMARY — pelvis + legs required)
-  #   feet_bearing:   5.0 × 0.76     =  3.8  (extra incentive for symmetric loading)
-  #   pose:           2.0 × 1.0      =  2.0  (regularization, prevents extreme joints)
-  #   hold_still:     2.0 × ~0.5     = ~1.0  (penalises large base velocity / falls)
-  #   Total max per step ≈ 16.8
+  # Reward balance (per-step values at perfect standing, both feet bearing load):
+  #   upright_gated:  +10.0 × 1.0 × 1.0  = 10.0  (PRIMARY: pelvis upright + feet planted)
+  #   base_height:     +3.0 × 1.0        =  3.0  (pelvis at ~0.72 m above terrain)
+  #   feet_bearing:    +5.0 × 0.76       =  3.8  (both feet bearing full bodyweight)
+  #   pose:            +2.0 × ~0.8       = ~1.6  (joints near HOME_KEYFRAME)
+  #   hold_still:      +2.0 × ~0.7       = ~1.4  (low base velocity when stable)
+  #   body_ang_vel:    -0.05 × 1.0       ≈  0.0  (still torso → no penalty)
+  #   action_rate_l2:  -0.01 × ~0        ≈  0.0  (smooth actions → no penalty)
+  #   self_collision:  -0.2 × 0          =  0.0  (no collisions when stable)
+  #   Total positive max per step ≈ 19.8
+  #
+  # Arm-only / upper-body-only balance (feet off ground):
+  #   upright_gated gate = 0 → reward 0; feet_bearing = 0; base_height = varies
+  #   Total ≈ 1-3 vs 19.8 for proper balance (6-20× incentive for leg use)
   cfg.rewards["pose"].weight = 2.0
 
-  # body_ang_vel and angular_momentum now use bounded exp(-x²/std²) kernels
-  # (see rewards.py), but they are stability-shaping signals for a policy
-  # that already stands. Enable them once the robot can stand reliably;
-  # leaving them active from iteration 0 adds value-function noise that
-  # fights bootstrapping. Same for action_rate_l2.
+  # STABILITY-SHAPING SIGNALS — enabled now that the robot can stand (episode
+  # length 85, upright_gated kernel 0.8+). These were disabled at bootstrap
+  # to avoid value-function noise before any reward signal existed; they are
+  # now safe to turn on and directly address the observed failures:
+  #
+  #   body_ang_vel (-0.05): penalises torso roll/pitch angular velocity.
+  #     TORSO ROTATION is the policy's current shortcut for balance — swinging
+  #     the upper body shifts angular momentum and momentarily rights the pelvis
+  #     faster than leg corrections can. body_ang_vel directly taxes this
+  #     strategy, making upper-body compensation more expensive than proper
+  #     ankle/knee corrections.
+  #
+  #   action_rate_l2 (-0.01): penalises ||a_t - a_{t-1}||².
+  #     mean_action_acc reached 6.5 (near the clip_actions=3 ceiling per joint),
+  #     meaning the policy oscillates actions at maximum rate every step. This
+  #     produces jerky, non-generalising behaviour, worsening self_collision,
+  #     reducing hold_still, and causing the training reward to oscillate rather
+  #     than monotonically improve. The penalty forces the policy to commit to
+  #     smooth, sustained corrective actions instead.
+  #
+  #   angular_momentum: keep at 0 until action_rate and body_ang_vel stabilise.
   cfg.rewards["body_ang_vel"].params["std"] = 1.0
-  cfg.rewards["body_ang_vel"].weight = 0.0  # Re-enable (e.g. -0.05) once robot can stand.
+  cfg.rewards["body_ang_vel"].weight = -0.05
   cfg.rewards["angular_momentum"].params["std"] = 1.0
-  cfg.rewards["angular_momentum"].weight = 0.0  # Re-enable (e.g. -0.01) once robot can stand.
-  cfg.rewards["action_rate_l2"].weight = 0.0  # Re-enable (e.g. -0.01) once robot can stand.
+  cfg.rewards["angular_momentum"].weight = 0.0
+  cfg.rewards["action_rate_l2"].weight = -0.01
 
   # G1 standing height overrides -- terrain curriculum and fell_over
   # termination both use the same "is standing" threshold.
@@ -261,11 +285,13 @@ def unitree_g1_rough_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   # standing height -- random policy actions perturb the pelvis enough to
   # cross that threshold in a handful of steps, collapsing every episode.
   # 0.45 m (57% of standing height) is clearly fallen, not just crouching.
-  # min_uprightness=0.2 allows up to ~80 degrees of tilt before terminating;
-  # the robot needs this room to discover the standing attractor before it
-  # learns to correct itself. Tighten both once the robot reliably stands.
+  # min_uprightness=0.35 (70° max tilt): was 0.2 (80°) during early bootstrap
+  # when the robot needed maximum room to discover the standing attractor.
+  # Now that the robot can stand (episode length 85+, upright_gated 0.8+),
+  # tightening prevents the policy from accumulating rewards while nearly
+  # horizontal, which corrupts the value function with late-fall states.
   cfg.terminations["fell_over"].params["min_height"] = 0.45
-  cfg.terminations["fell_over"].params["min_uprightness"] = 0.2
+  cfg.terminations["fell_over"].params["min_uprightness"] = 0.35
 
   # Wire the generic self_collision placeholder (defined in
   # standup_env_cfg.py) to this robot's actual sensor name and a stronger

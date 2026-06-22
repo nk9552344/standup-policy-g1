@@ -255,7 +255,14 @@ def make_standup_env_cfg() -> ManagerBasedRlEnvCfg:
       func=mdp.reset_joints_by_offset,
       mode="reset",
       params={
-        "position_range": (0.0, 0.0),
+        # Small joint-position noise provides episode-to-episode variation and
+        # prevents the policy from over-fitting to the exact HOME_KEYFRAME
+        # starting state. ±0.05 rad is well within the PD controller's
+        # stiffness range (HOME_KEYFRAME is a stable equilibrium, so small
+        # perturbations are immediately corrected). Deliberately kept small:
+        # larger noise extends the range of initial states but risks starting
+        # the robot off-balance before the policy has learned to correct it.
+        "position_range": (-0.05, 0.05),
         "velocity_range": (0.0, 0.0),
         "asset_cfg": SceneEntityCfg("robot", joint_names=(".*",)),
       },

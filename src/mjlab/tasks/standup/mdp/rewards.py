@@ -356,12 +356,18 @@ def upright_with_feet_gate(
   bodyweight_n Newtons total force, giving a clear full-reward target for the
   policy to aim at.
 
-  asset_cfg: body_names=("torso_link",) for G1 to track the torso quaternion.
+  asset_cfg: body_names=() (root link = pelvis) for G1. Do NOT set this to
+    "torso_link" — torso tracking allows the waist-bending compensation local
+    optimum (torso stays vertical by bending the waist while the pelvis falls,
+    earning full upright reward without any leg corrections). body_names=()
+    → asset_cfg.body_ids is falsy → uses root_link_quat_w (pelvis).
     Set per-robot.
   sensor_name: ContactSensor with reduce="netforce" and two primaries (left
     and right foot subtrees). data.force shape must be [B, 2, 3].
   bodyweight_n: Normalisation constant in Newtons (robot_mass × 9.8).
-    Gate = 1.0 at this force. For G1 (~23 kg): 225 N.
+    Gate = 1.0 at this force. For G1 (~23 kg): 225 N. Use half-bodyweight
+    (112.5 N) if stepping should not be penalised (gate=1 when one foot
+    bears full load).
   """
   # --- Uprightness component ---
   asset: Entity = env.scene[asset_cfg.name]
