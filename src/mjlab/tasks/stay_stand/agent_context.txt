@@ -85,12 +85,19 @@ mdp.upright (in `mjlab/tasks/velocity/mdp/rewards.py`)
   upright, smoothly decays. We do NOT import this cross-task (would
   introduce a velocity dependency); using flat_orientation_l2 instead.
 
-mdp.is_alive / mdp.bad_orientation / mdp.time_out
+mdp.is_alive / mdp.time_out / local fell_over
 - is_alive: 1.0 if not terminated, 0.0 otherwise.
-- bad_orientation(limit_angle): True when torso tilt exceeds limit_angle.
 - time_out: True when episode reaches `episode_length_s`. Pair with
   `time_out=True` flag in TerminationTermCfg so it doesn't penalize the
   policy (handled separately by the manager).
+- fell_over(limit_angle): True when torso tilt exceeds limit_angle. Lives
+  inline in stay_stand_env_cfg.py (NOT in mjlab.envs.mdp -- the shared
+  package ships only catastrophic_state, which checks height bounds only,
+  not orientation). Implemented via -projected_gravity_b[:, 2] <
+  cos(limit_angle). A previous revision called this `mdp.bad_orientation`
+  but that symbol does not exist; the standup task forked its own
+  fell_over in tasks/standup/mdp/terminations.py. Stay-stand keeps the
+  helper inline to honor the "no mdp/ subfolder" rule in section 7.
 
 Events
 - `mode="interval"` sampled from `interval_range_s` on each reset, so the
@@ -137,12 +144,11 @@ config/g1/env_cfgs.py
 - Sets sim.njmax=300, ccd_iterations=50, contact_sensor_maxmatch=64 (flat-
   ground optimization).
 - Wires viewer.body_name="torso_link".
-- Overrides posture std with _G1_POSTURE_STD (loose per-joint values
-  ranging from 0.20 to 0.60). Hip_pitch/knee/ankle get the tighter values
-  but still LOOSER than what velocity G1 uses for standing (0.05).
-  Rationale: velocity G1's track_velocity rewards dominate, so its tight
-  posture std doesn't matter. Here posture IS the dominant positive
-  signal, so it must fire reliably.
+- Overrides posture std with _G1_POSTURE_STD = {".*": 0.5} (flat across
+  all 29 joints). Previously had per-joint values 0.20-0.60 with the
+  tightest stds on waist_roll/hip_roll; under exp(-mean(...)), those
+  tight joints dominated and collapsed the reward whenever the policy
+  perturbed them. See section 5, session 3.
 - play=True: sets episode_length_s=1e9 and disables actor obs corruption.
 
 config/g1/rl_cfg.py
@@ -150,8 +156,9 @@ config/g1/rl_cfg.py
 - Distribution: GaussianDistribution, init_std=0.3, std_type="scalar".
   *** init_std MUST stay small. See section 5 below. ***
 - PPO: lr=1e-3 with adaptive KL schedule (desired_kl=0.01),
-  entropy_coef=0.001 (intentionally low), clip_param=0.2,
-  num_learning_epochs=5, num_mini_batches=4, num_steps_per_env=24,
+  entropy_coef=0.0 (zeroed in session 3), clip_param=0.2,
+  num_learning_epochs=5, num_mini_batches=4, num_steps_per_env=128
+  (raised from 24 in session 3 to cover a full balance episode),
   gamma=0.99, lam=0.95, max_grad_norm=1.0.
 - experiment_name="g1_stay_stand", save_interval=50, max_iterations=3000.
 
@@ -208,6 +215,39 @@ Why velocity G1 works with init_std=1.0 but stay_stand doesn't
   exploration noise that's fine for a walker is destabilizing for a
   stander.
 
+Symptom 3 (session 3): After fix attempt 2, Policy/mean_std rose
+monotonically 0.30 -> 0.325+, Train/mean_reward peaked at step 800-1000
+and then COLLAPSED, mean_episode_length tracked reward (peak ~84,
+collapse to ~74). Same self-reinforcing failure mode as before, just
+slower.
+
+Diagnosis 3 (three independent root causes, all real):
+- entropy_coef=0.001 was still nonzero. Even tiny entropy bonuses
+  dominate when the policy gradient is near-zero (which it is in steady
+  balance: alive and posture are flat-positive, moving doesn't improve
+  them). The bonus pushed std up, std-driven joint perturbations broke
+  balance, terminations zeroed alive, loop reinforced.
+- num_steps_per_env=24 (= 0.48 s of rollout) was shorter than a typical
+  episode (1.2-1.7 s). GAE was computing advantages on episode fragments
+  without knowing how they ended. The critic could not learn that
+  perturb-then-fall was worse than hold-pose-and-survive because it
+  never saw the full causal chain in one rollout. This was the dominant
+  structural cause of the post-step-1000 collapse.
+- _G1_POSTURE_STD had tight per-joint stds (waist_roll=0.2, hip_roll=0.25)
+  that, under the exp(-MEAN(error**2/std**2)) formulation, let a single
+  drifting joint cut the dominant positive reward by 60%+. A 0.15 rad
+  waist_roll drift alone contributes 0.56 to the mean; a few joints
+  simultaneously push the mean past 1.0 and posture collapses to exp(-1)
+  ~= 0.37. The collapse correlated with the policy starting to perturb
+  these joints.
+
+Fix attempt 3 (CURRENT STATE):
+- entropy_coef: 0.001 -> 0.0.
+- num_steps_per_env: 24 -> 128 (2.56 s, covers a full episode).
+- _G1_POSTURE_STD: per-joint dict -> flat {".*": 0.5}.
+- Everything else (3-reward setup, init_std=0.3, fell_over @ 80deg,
+  scale_rewards_by_dt, no DR, no push) unchanged.
+
 ================================================================================
 6. EXPECTED TRAINING SIGNATURE (post-fix)
 ================================================================================
@@ -231,7 +271,10 @@ If reward stays flat / declines after these fixes, NEXT THINGS TO TRY:
    (smoke test: spawn G1 with no policy, just zero actions, check if it
    stays up for 20 s).
 2. Lower init_std further (0.3 -> 0.15).
-3. Set entropy_coef=0.0 to fully kill the std-inflation pressure.
+3. Freeze std: distribution_cfg["learn_std"]=False. Standup task hit the
+   same std-growth pathology even at entropy_coef=0 and had to disable
+   log_std learning entirely (see standup/config/g1/rl_cfg.py). Apply
+   this here if Policy/mean_std still drifts upward after session 3.
 4. Reduce decimation to 2 (100 Hz policy) so the policy can react faster
    to balance perturbations.
 5. Add base_lin_vel_l2 and base_ang_vel_l2 penalties (small weight, like

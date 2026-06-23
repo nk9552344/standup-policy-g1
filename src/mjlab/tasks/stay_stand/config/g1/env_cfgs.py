@@ -8,25 +8,15 @@ from mjlab.envs import ManagerBasedRlEnvCfg
 from mjlab.envs.mdp.actions import JointPositionActionCfg
 from mjlab.tasks.stay_stand.stay_stand_env_cfg import make_stay_stand_env_cfg
 
-# Per-joint posture std. mdp.posture uses exp(-mean(error**2/std**2)). These
-# values are intentionally loose so that the positive reward fires meaningfully
-# during exploration. Tighten via curriculum once the policy converges.
-_G1_POSTURE_STD = {
-  r".*hip_pitch.*": 0.4,
-  r".*hip_roll.*": 0.25,
-  r".*hip_yaw.*": 0.3,
-  r".*knee.*": 0.5,
-  r".*ankle_pitch.*": 0.3,
-  r".*ankle_roll.*": 0.25,
-  r".*waist_yaw.*": 0.3,
-  r".*waist_roll.*": 0.2,
-  r".*waist_pitch.*": 0.25,
-  r".*shoulder_pitch.*": 0.5,
-  r".*shoulder_roll.*": 0.5,
-  r".*shoulder_yaw.*": 0.5,
-  r".*elbow.*": 0.5,
-  r".*wrist.*": 0.6,
-}
+# Per-joint posture std. mdp.posture uses exp(-mean(error**2/std**2)). The
+# mean across all 29 joints is unforgiving: a single tight joint with even a
+# moderate error pulls the entire reward toward zero. waist_roll=0.2 and
+# hip_roll=0.25 were the culprits behind the post-step-1000 reward collapse
+# -- a 0.15 rad drift on waist_roll alone contributes 0.56 to the mean,
+# enough that a few simultaneous joint perturbations cut posture by 60%+.
+# A flat 0.5 across all joints keeps the positive reward firing reliably
+# during exploration. Tighten selectively via curriculum once reward stabilizes.
+_G1_POSTURE_STD = {r".*": 0.5}
 
 
 def unitree_g1_stay_stand_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:

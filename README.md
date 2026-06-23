@@ -19,3 +19,4 @@ uv run play Mjlab-StayStand-Rough-Unitree-G1 \
 https://github.com/InternRobotics/HoST
 
 https://wandb.ai/nk9552344-infosys/mjlab/runs/rawno0s9?nw=nwusernk9552344
+

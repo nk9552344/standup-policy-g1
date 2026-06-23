@@ -39,6 +39,8 @@ keeps the sensor cfg available if you reintroduce an air-time-derived
 signal later.
 """
 
+import math
+
 from mjlab.asset_zoo.robots import (
   G1_ACTION_SCALE,
   get_g1_robot_cfg,
@@ -147,46 +149,19 @@ def unitree_g1_rough_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
 
   joint_pos_action = cfg.actions["joint_pos"]
   assert isinstance(joint_pos_action, JointPositionActionCfg)
-  # SHRINK THE ACTION SCALE FOR STANDUP. G1_ACTION_SCALE is tuned for
-  # locomotion (knee ~0.35 rad per unit raw action), which is fine for a
-  # walking gait. But for standup -- especially stage 0 where the robot
-  # spawns standing and the optimal policy is "output ~0 to hold default
-  # pose" -- this scale is way too large for bootstrapping. At iter 0
-  # the actor MLP outputs random values with magnitude ~1.0 per dim, so
-  # every joint is commanded ~0.35 rad off default at step 0 *before* any
-  # learning has happened. The robot is jerked out of the default pose
-  # immediately and the policy has to first un-learn this random offset
-  # before any pose/upright reward can fire. Multiplying by 0.25 makes
-  # the worst-case random-init action only ~0.09 rad off default per
-  # joint, which the actuators can hold near default pose, so pose/
-  # upright rewards fire from iter 0 and bootstrap learning. Scale this
-  # back up once the policy can reliably hold default pose, since harder
-  # curriculum stages (recovery from prone) need larger action ranges.
+  # SHRINK THE ACTION SCALE UNIFORMLY. G1_ACTION_SCALE is tuned for
+  # locomotion (knee ~0.35 rad per unit raw action), which is far too large
+  # for a "hold default pose" balance task. At iter 0 the actor MLP outputs
+  # random values ~1.0 per dim, so without shrinking every joint is
+  # commanded ~0.35 rad off default at step 0 *before* any learning.
+  # Multiplying by 0.25 makes the worst-case random-init action only ~0.09
+  # rad off default per joint, which the actuators can hold near HOME, so
+  # the upright / pose / hold_still rewards fire from iter 0 and bootstrap
+  # learning. A uniform multiplier (no per-joint asymmetry) keeps the
+  # exploration distribution shaped like the prior and avoids the leg-vs-
+  # arm exploration imbalance that previously biased the policy toward
+  # large leg motions before it had learned even basic stand-still.
   joint_pos_action.scale = {k: v * 0.25 for k, v in G1_ACTION_SCALE.items()}
-  # LEG SCALE INCREASE for the joints that actually do balance work.
-  # G1_ACTION_SCALE is effort/stiffness based; at the global ×0.25 multiplier
-  # the per-step random exploration on knee/hip_pitch is ≈0.026 rad
-  # (init_std=0.4 × 0.25 × ≈0.35 rad/unit), so the random walk over a 24-step
-  # rollout reaches only ≈0.13 rad of leg flexion -- far below the ≈0.3 rad
-  # of knee bend a real corrective step requires. The policy therefore never
-  # samples a successful step during exploration, never sees the value of a
-  # step, and collapses to "output zero". Bumping ankle, hip_pitch and knee
-  # to ×0.5 doubles per-step exploration and lets a multi-step random walk
-  # cover the ±0.3 rad range needed for stepping/squatting corrections.
-  # Arms, waist, hip_yaw, hip_roll stay at ×0.25 (no need for large excursions;
-  # tight scale keeps upper-body cheats and lateral leg wobble suppressed).
-  joint_pos_action.scale[".*_ankle_pitch_joint"] = (
-    G1_ACTION_SCALE[".*_ankle_pitch_joint"] * 0.5
-  )
-  joint_pos_action.scale[".*_ankle_roll_joint"] = (
-    G1_ACTION_SCALE[".*_ankle_roll_joint"] * 0.5
-  )
-  joint_pos_action.scale[".*_hip_pitch_joint"] = (
-    G1_ACTION_SCALE[".*_hip_pitch_joint"] * 0.5
-  )
-  joint_pos_action.scale[".*_knee_joint"] = (
-    G1_ACTION_SCALE[".*_knee_joint"] * 0.5
-  )
 
   cfg.viewer.body_name = "torso_link"
 
@@ -200,231 +175,119 @@ def unitree_g1_rough_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   cfg.events["foot_friction"].params["asset_cfg"].geom_names = geom_names
   cfg.events["base_com"].params["asset_cfg"].body_names = ("torso_link",)
 
-  # POSE STD PER-JOINT PARTITION (session 5 fix).
-  # The previous uniform std=0.25 was killing dynamic balance: any knee
-  # flexion past ≈0.45 rad and any hip swing past ≈0.45 rad collapsed the
-  # pose kernel, so the policy converged to "lock all joints near HOME".
-  # The robot ended up using only static stiffness to balance and never
-  # learned stepping or knee-flexion corrections.
+  # =====================================================================
+  # MINIMAL STAY-STAND REWARD SHAPING
+  # =====================================================================
+  # Goal: the simplest reward structure that teaches the robot to stay
+  # standing from a stable upright start. No prescriptive constraints on
+  # HOW to balance -- arms, torso, hips, knees, ankles are all valid
+  # tools. Earlier iterations of this file added many task-specific
+  # signals (upright_gated, feet_bearing_weight, ankle_corrective,
+  # body_ang_vel, angular_momentum) to "force" a particular leg-based
+  # strategy. Every one of them either competed with the basic balance
+  # gradient or directly penalised legitimate corrective motions, so the
+  # policy collapsed to either lock-down or torso-swing failure modes.
+  # The minimal set below has FOUR positive shaping rewards (upright,
+  # base_height, pose, hold_still) and the two small standard penalties
+  # (dof_pos_limits, self_collision). That's it.
   #
-  # New scheme: keep arms and waist tight (suppresses arm-flailing and
-  # waist-bending balance cheats that previously emerged), but allow legs
-  # to move freely. Knee std=0.6 makes a full ±0.5 rad squat barely affect
-  # the kernel; hip_pitch std=0.5 allows full stepping range. The
-  # task-level rewards (upright_gated, base_height, feet_bearing_weight,
-  # ankle_corrective) provide the actual "return to standing pose" signal
-  # for legs -- much stronger and more correctly oriented than a pose
-  # attractor toward HOME could be.
-  cfg.rewards["pose"].params["std_values"] = {
-    # Arms: tight -- arm flailing should never be a balance strategy.
-    ".*_shoulder_pitch_joint": 0.15,
-    ".*_shoulder_roll_joint": 0.15,
-    ".*_shoulder_yaw_joint": 0.15,
-    ".*_elbow_joint": 0.15,
-    ".*_wrist_roll_joint": 0.15,
-    ".*_wrist_pitch_joint": 0.15,
-    ".*_wrist_yaw_joint": 0.15,
-    # Waist: very tight -- waist-bending is the "upper-body compensation"
-    # cheat that lets the torso stay vertical while the pelvis falls.
-    "waist_yaw_joint": 0.10,
-    "waist_pitch_joint": 0.10,
-    "waist_roll_joint": 0.10,
-    # Hips: loose on pitch (stepping), moderate on roll (lateral), tight
-    # on yaw (don't want legs twisting in/out for no reason).
-    ".*_hip_pitch_joint": 0.5,
-    ".*_hip_roll_joint": 0.4,
-    ".*_hip_yaw_joint": 0.2,
-    # Knees: very loose -- full bend range is a legitimate balance tool.
-    ".*_knee_joint": 0.6,
-    # Ankles: moderate -- corrections needed, but joint range itself is
-    # narrow (±0.26 rad on roll, ±0.87/0.52 on pitch).
-    ".*_ankle_pitch_joint": 0.4,
-    ".*_ankle_roll_joint": 0.3,
-  }
+  # Per-step reward at perfect HOME_KEYFRAME standing:
+  #   upright         +5.0 × 1.0  =  5.0   (primary: torso vertical)
+  #   base_height     +2.0 × 1.0  =  2.0   (pelvis at ~0.72 m)
+  #   pose            +1.0 × ~1.0 = ~1.0   (joints near HOME)
+  #   hold_still      +1.0 × ~1.0 = ~1.0   (base at rest)
+  #   dof_pos_limits  -0.05 × 0   =  0.0
+  #   self_collision  -0.1 × 0    =  0.0
+  #   Total per-step  ≈ 9.0   (cumulative over 20s × 50Hz episode ≈ 9000)
+  # =====================================================================
 
+  # UPRIGHT: primary balance signal. Track torso_link uprightness (NOT
+  # pelvis) -- torso is what visually defines "standing", and tracking it
+  # allows the natural human-like strategy of hip flex to keep the torso
+  # upright while the pelvis shifts slightly. The user explicitly wants
+  # any body part to be usable for balance.
+  # std=sqrt(0.2)≈0.45 gives exp(-1)=0.37 at ~26° tilt and exp(-0.25)=0.78
+  # at ~13° tilt -- a smooth gradient across the full operating range
+  # without collapsing to zero at the tilts the policy actually visits.
   cfg.rewards["upright"].params["asset_cfg"].body_names = ("torso_link",)
-  cfg.rewards["body_ang_vel"].params["asset_cfg"].body_names = ("torso_link",)
+  cfg.rewards["upright"].params["std"] = math.sqrt(0.2)
+  cfg.rewards["upright"].weight = 5.0
 
-  # UPRIGHT STD calibrated to the robot's 20° operating tilt. See the long
-  # comment in the session 3 notes for the gradient analysis. std=sqrt(0.117)
-  # gives exp(-1)=0.37 kernel at 20° vs exp(-2.3)≈0.1 with old std=sqrt(0.05).
-  # Applied to BOTH upright (weight 0, kept for reference) and upright_gated.
-  _upright_std = 0.117 ** 0.5  # sin²(20°) = 0.117
-  cfg.rewards["upright"].params["std"] = _upright_std
-  cfg.rewards["upright"].weight = 0.0  # Replaced by upright_gated below.
+  # POSE: gentle attractor toward HOME_KEYFRAME on every joint with a
+  # single uniform std. Per-joint std partitions are over-engineering for
+  # this task -- the only role of pose here is to discourage drift away
+  # from the default arm/leg configuration when the policy has no other
+  # reason to move. std=0.3 is loose enough that small corrective motions
+  # (knee flex, ankle dorsiflexion, hip lean) barely affect the kernel
+  # while large arm flailing or full squatting noticeably reduces it.
+  cfg.rewards["pose"].params["std_values"] = {".*": 0.3}
+  cfg.rewards["pose"].weight = 1.0
 
-  # UPRIGHT GATED BY FEET CONTACT: the primary balance signal (weight 10).
-  # Returns upright_score × feet_gate where:
-  #   upright_score = exp(-xy²/std²) ∈ [0, 1] -- PELVIS uprightness
-  #   feet_gate     = clamp(foot_force / bodyweight_n, 0, 1) ∈ [0, 1]
-  #
-  # KEY DESIGN DECISIONS vs previous iteration:
-  #
-  # 1. Track PELVIS (root link), NOT torso_link.
-  #    Torso tracking allowed the "waist-compensation" local optimum:
-  #    robot bends at the waist (torso stays upright) while the pelvis falls,
-  #    earning full upright reward without using any leg joints.
-  #    Pelvis tracking makes this impossible: only leg corrections
-  #    (ankle/knee/hip) can keep the pelvis upright.
-  #    body_names=() → asset_cfg.body_ids is falsy → uses root_link_quat_w.
-  #
-  # 2. bodyweight_n = G1_MASS × 9.8 / 2 = 112.5 N (half-bodyweight threshold).
-  #    Using full bodyweight (225 N) means the gate drops when one foot lifts
-  #    to step, penalising stepping and discouraging the stepping reflex.
-  #    Using half-bodyweight: gate = 1.0 whenever either foot bears full load.
-  #      both feet standing:    total_force ≈ 225 N → gate = clamp(2.0, 0, 1) = 1.0
-  #      stepping (one foot):   total_force ≈ 112 N → gate = clamp(1.0, 0, 1) = 1.0
-  #      airborne:              total_force = 0 N   → gate = 0.0
-  #    This allows free stepping to catch pushes without any reward penalty.
-  cfg.rewards["upright_gated"].params["asset_cfg"].body_names = ()  # pelvis / root link
-  cfg.rewards["upright_gated"].params["std"] = _upright_std
+  # HOLD_STILL: gentle preference for low base velocity. Weight 1.0 (not
+  # 0.5 from session 5, not 2.0 from earlier) is the lightest version
+  # that still rewards stillness without out-weighing a corrective
+  # motion. With no pushes in the base task, this is a free reward most
+  # of the time -- the policy just needs to keep the pelvis still.
+  cfg.rewards["hold_still"].weight = 1.0
+
+  # BASE_HEIGHT: keep pelvis at HOME_KEYFRAME actual height (~0.72 m
+  # with bent knees). Without this, the policy can earn full upright +
+  # pose by slowly sinking into a deep squat. Gaussian centred at 0.72 m
+  # with std=0.10 m gives exp(-1)≈0.37 at 10 cm below target.
+  cfg.rewards["base_height"].params["target_height"] = 0.72
+  cfg.rewards["base_height"].params["std"] = 0.10
+  cfg.rewards["base_height"].weight = 2.0
+
+  # All prescriptive "use legs / don't swing torso" terms DISABLED. The
+  # user's brief explicitly allows balance via arms, torso, hips, knees,
+  # ankles or feet. The right place for the policy to learn HOW to
+  # balance is the policy gradient, not a hand-engineered reward menu.
+  cfg.rewards["upright_gated"].params["asset_cfg"].body_names = ()
+  cfg.rewards["upright_gated"].params["std"] = math.sqrt(0.2)
   cfg.rewards["upright_gated"].params["sensor_name"] = feet_ground_cfg.name
-  cfg.rewards["upright_gated"].params["bodyweight_n"] = 112.5  # half-bodyweight
-  cfg.rewards["upright_gated"].weight = 10.0
+  cfg.rewards["upright_gated"].params["bodyweight_n"] = 225.0
+  cfg.rewards["upright_gated"].weight = 0.0
 
-  # Reward balance (per-step values at perfect standing, both feet bearing load):
-  #   upright_gated:  +10.0 × 1.0 × 1.0  = 10.0  (PRIMARY: pelvis upright + feet planted)
-  #   base_height:     +3.0 × 1.0        =  3.0  (pelvis at ~0.72 m above terrain)
-  #   feet_bearing:    +5.0 × 0.76       =  3.8  (both feet bearing full bodyweight)
-  #   pose:            +2.0 × ~0.8       = ~1.6  (joints near HOME_KEYFRAME)
-  #   hold_still:      +2.0 × ~0.7       = ~1.4  (low base velocity when stable)
-  #   body_ang_vel:    -0.05 × 1.0       ≈  0.0  (still torso → no penalty)
-  #   action_rate_l2:  -0.01 × ~0        ≈  0.0  (smooth actions → no penalty)
-  #   self_collision:  -0.2 × 0          =  0.0  (no collisions when stable)
-  #   Total positive max per step ≈ 19.8
-  #
-  # Arm-only / upper-body-only balance (feet off ground):
-  #   upright_gated gate = 0 → reward 0; feet_bearing = 0; base_height = varies
-  #   Total ≈ 1-3 vs 19.8 for proper balance (6-20× incentive for leg use)
-  cfg.rewards["pose"].weight = 2.0
+  cfg.rewards["feet_bearing_weight"].params["sensor_name"] = feet_ground_cfg.name
+  cfg.rewards["feet_bearing_weight"].params["bodyweight_n"] = 225.0
+  cfg.rewards["feet_bearing_weight"].weight = 0.0
 
-  # STABILITY-SHAPING SIGNALS — penalise torso-swing balance strategy.
-  #
-  #   body_ang_vel (-0.5): penalises torso roll/pitch angular velocity, tracking
-  #     torso_link's own ang_vel_xy. TORSO ROTATION was the policy's preferred
-  #     balance shortcut — swinging the upper body shifts angular momentum and
-  #     momentarily rights the pelvis faster than leg corrections can. This
-  #     term taxes that strategy directly.
-  #
-  #     CRITICAL HISTORY: in earlier runs this term had its KERNEL INVERTED in
-  #     rewards.py. The function returned exp(-xy²/std²) (1 at rest, 0 at chaos),
-  #     and with negative weight that meant "more spinning = less penalty",
-  #     i.e. the term ACTIVELY REWARDED the torso-swing failure mode it was
-  #     meant to suppress. The kernel is now (1 - exp(-xy²/std²)) (0 at rest,
-  #     saturates to 1 at chaos), and the weight magnitude is bumped from -0.05
-  #     to -0.5 so the corrected penalty is large enough (~0.4/step at 2 rad/s
-  #     torso swing) to outweigh whatever short-term upright_gated boost the
-  #     swing strategy buys.
-  #
-  #   angular_momentum (-0.5): bounded penalty on whole-body angular momentum.
-  #     Had the same inverted-kernel bug in rewards.py. Now fixed and enabled —
-  #     gives an additional brake on any rotation-based balance strategy
-  #     (not just torso pitch/roll, but also waist twist / arm flailing).
-  #
-  #   action_rate_l2 (-0.01): penalises ||a_t - a_{t-1}||². Kept small; the
-  #     mean_action_acc=6.5 chaos pattern earlier in training was largely
-  #     driven by the same torso-swing strategy, so fixing the angular-velocity
-  #     penalties should reduce action chaos as a side effect.
-  #
-  # SESSION 5 TUNING: angular_momentum.std bumped 1.0 -> 2.0. The old std=1.0
-  # saturated at ≈1 kg·m²/s which is roughly the angular momentum of ONE
-  # SWINGING LEG during a corrective step. That meant the penalty fired
-  # full-strength against legitimate stepping motions, not just torso swings.
-  # body_ang_vel std unchanged because it only tracks TORSO link pitch/roll
-  # angular velocity -- legs swinging do not rotate the torso, so it does not
-  # need to be loosened to permit stepping.
+  cfg.rewards["ankle_corrective"].params["std"] = 0.025
+  cfg.rewards["ankle_corrective"].weight = 0.0
+
+  cfg.rewards["body_ang_vel"].params["asset_cfg"].body_names = ("torso_link",)
   cfg.rewards["body_ang_vel"].params["std"] = 1.0
-  cfg.rewards["body_ang_vel"].weight = -0.5
+  cfg.rewards["body_ang_vel"].weight = 0.0
+
   cfg.rewards["angular_momentum"].params["std"] = 2.0
-  cfg.rewards["angular_momentum"].weight = -0.5
-  cfg.rewards["action_rate_l2"].weight = -0.01
+  cfg.rewards["angular_momentum"].weight = 0.0
 
-  # SESSION 5: hold_still weight 2.0 -> 0.5. hold_still penalises pelvis
-  # linear+angular velocity -- exactly what stepping motions produce. At
-  # weight 2.0 a corrective 0.5 m/s step cost ≈1.3/step (kernel drops from
-  # 1.0 to 0.37), which over a 5-step stepping window outweighed the value
-  # of avoiding a small push. At 0.5 the cost is ≈0.3/step, soft enough to
-  # not block stepping but still preferring stillness when no push is
-  # present. upright_gated + base_height + pose still pin the robot to its
-  # initial position when nothing is disturbing it.
-  cfg.rewards["hold_still"].weight = 0.5
+  cfg.rewards["action_rate_l2"].weight = 0.0
 
-  # G1 standing height overrides -- terrain curriculum and fell_over
-  # termination both use the same "is standing" threshold.
-  cfg.curriculum["terrain_levels"].params["min_standing_height"] = _G1_MIN_STANDING_HEIGHT
-  # TIGHTEN PROMOTION CRITERION: default min_standing_uprightness=0.8 (cos37°)
-  # is too loose -- the robot got promoted at only 37° average tilt, immediately
-  # failed on harder terrain, and repeated in a ~600-step oscillation cycle that
-  # prevents consistent learning. Setting 0.95 (cos18°) requires near-perfect
-  # uprightness for promotion so only a genuinely stable policy advances.
-  cfg.curriculum["terrain_levels"].params["min_standing_uprightness"] = 0.95
-
-  # fell_over thresholds: these must NOT be close to the HOME_KEYFRAME height
-  # (~0.72-0.75 m with bent knees). min_height=0.65 is only 7-10 cm below
-  # standing height -- random policy actions perturb the pelvis enough to
-  # cross that threshold in a handful of steps, collapsing every episode.
-  # 0.45 m (57% of standing height) is clearly fallen, not just crouching.
-  # min_uprightness=0.35 (70° max tilt): was 0.2 (80°) during early bootstrap
-  # when the robot needed maximum room to discover the standing attractor.
-  # Now that the robot can stand (episode length 85+, upright_gated 0.8+),
-  # tightening prevents the policy from accumulating rewards while nearly
-  # horizontal, which corrupts the value function with late-fall states.
-  cfg.terminations["fell_over"].params["min_height"] = 0.45
-  cfg.terminations["fell_over"].params["min_uprightness"] = 0.35
-
-  # Wire the generic self_collision placeholder (defined in
-  # standup_env_cfg.py) to this robot's actual sensor name and a stronger
-  # weight, rather than adding a second duplicate reward term.
+  # Wire the generic self_collision placeholder to this robot's sensor.
   cfg.rewards["self_collision"].params["sensor_name"] = self_collision_cfg.name
   cfg.rewards["self_collision"].params["force_threshold"] = 10.0
-  cfg.rewards["self_collision"].weight = -0.2
+  cfg.rewards["self_collision"].weight = -0.1
 
-  # FEET BEARING WEIGHT: reward ground-reaction force through feet.
-  # When the robot abandons legs for arm-only balance, foot forces drop to 0
-  # and this reward collapses, directly opposing that failure mode.
-  # The feet_ground_contact sensor exposes two primaries (left and right
-  # ankle subtrees) with reduce="netforce", so data.force is [B, 2, 3].
-  #
-  # SESSION 5: bodyweight_n 225 -> 112.5 (half-bodyweight). At 225 N
-  # (full bodyweight), tanh(force/225) gives 0.76 when both feet bear full
-  # bodyweight but only 0.46 when one foot lifts to step (single-foot stance
-  # at 112 N). That ≈0.3/step drop × weight=5 = 1.5/step penalty on stepping
-  # was actively training the policy NOT to step. At 112.5 N, tanh saturates
-  # near 1.0 for both-feet stance (~0.96) AND for single-foot stance bearing
-  # full bodyweight (~0.76), so stepping no longer costs reward. Only true
-  # leg-abandonment (both feet airborne) collapses the term.
-  cfg.rewards["feet_bearing_weight"].params["sensor_name"] = feet_ground_cfg.name
-  cfg.rewards["feet_bearing_weight"].params["bodyweight_n"] = 112.5  # half-bodyweight
-  cfg.rewards["feet_bearing_weight"].weight = 5.0
-  # ANKLE CORRECTIVE: direct, same-step reward for ankle_pitch/roll joints
-  # being in the corrective direction for the current pelvis tilt.
-  # WHY THIS FIXES THE HIP-STRATEGY PROBLEM:
-  #   Hip corrections show up in upright_gated in 1 step (direct kinematics).
-  #   Ankle corrections take 3-5 steps (CoP shift \u2192 GRF \u2192 pelvis acceleration).
-  #   PPO correctly prefers the faster signal, so it learns hips over ankles.
-  #   This reward fires in the SAME STEP as the ankle moves, breaking the
-  #   timing asymmetry: ankle in correct position now earns reward NOW,
-  #   regardless of whether the pelvis has had time to respond.
-  # SIGNAL: reward = clamp(-tilt_x \u00d7 mean(ankle_pitch - HOME) / std, 0, 1)
-  #   Forward tilt + dorsiflexion: positive \u2192 rewarded  \u2713
-  #   Standing + ankle at HOME: zero \u2192 no spurious incentive  \u2713
-  #   Wrong direction: zero (clamped, not penalised)  \u2713
-  cfg.rewards["ankle_corrective"].params["std"] = 0.025
-  cfg.rewards["ankle_corrective"].weight = 3.0
-  # BASE HEIGHT REWARD: continuous height gradient from standing (0.72 m) down
-  # to the fell_over floor (0.45 m). Without this, the robot can earn full
-  # upright_gated while slowly squatting because pelvis orientation alone does
-  # not penalise downward displacement. Gaussian centred at HOME_KEYFRAME actual
-  # pelvis height (~0.72 m with bent knees); std=0.10 m gives exp(-1)≈0.37 at
-  # 10 cm below target and ≈0 near the 0.45 m fell_over threshold.
-  # This adds a direct gradient for legs to support body weight at the right height.
-  cfg.rewards["base_height"].params["target_height"] = 0.72  # HOME actual pelvis z
-  cfg.rewards["base_height"].params["std"] = 0.10
-  cfg.rewards["base_height"].weight = 3.0
+  # =====================================================================
+  # TERMINATION + CURRICULUM
+  # =====================================================================
+  # fell_over: loose thresholds so the policy has room to recover from
+  # large tilts before the episode ends. min_height=0.40 m is 55% of
+  # standing height -- clearly fallen, not a squat. min_uprightness=0.2
+  # allows up to ~80° of tilt before termination, giving the policy time
+  # to discover that "tilting + corrective motion" still earns reward.
+  # Tighten once Episode_Reward/upright > 3.0 sustained.
+  cfg.terminations["fell_over"].params["min_height"] = 0.40
+  cfg.terminations["fell_over"].params["min_uprightness"] = 0.2
 
-  # air_time, foot_clearance, foot_slip overrides removed: these reward
-  # terms don't exist in standup_env_cfg.py (dropped upstream as gait-cycle-
-  # only terms with no standup analog).
+  # Terrain curriculum: loose promotion criterion. 0.7 = cos45° -- the
+  # robot only needs to end the episode with reasonable uprightness to
+  # advance, not perfect uprightness. Tighten only when the easier
+  # terrains are consistently solved. (For the flat task this whole
+  # curriculum is removed below.)
+  cfg.curriculum["terrain_levels"].params["min_standing_height"] = 0.55
+  cfg.curriculum["terrain_levels"].params["min_standing_uprightness"] = 0.7
 
   # Apply play mode overrides.
   if play:

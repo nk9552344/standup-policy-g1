@@ -251,31 +251,16 @@ def make_standup_env_cfg() -> ManagerBasedRlEnvCfg:
       func=mdp.reset_fallen_state,
       mode="reset",
       params={
-        # Always spawn upright. The robot starts standing and a fall
-        # terminates the episode, so no orientation curriculum is needed.
+        # Always spawn fully upright AND at rest. The task is "stay
+        # standing": the initial state must actually be a standing robot,
+        # not a robot moving sideways at episode start. The robot has
+        # plenty to learn from its own PD-controlled micro-tilts even
+        # with zero initial velocity, and removing the kick removes the
+        # constant "you need an immediate big correction" signal that was
+        # forcing the policy to overshoot at t=0.
         "orientation_mode": "standing",
         "height_range": (0.0, 0.0),
-        # INITIAL VELOCITY: give the robot a random horizontal push at
-        # every episode reset. This is the most direct way to force the
-        # policy to learn corrective leg strategies:
-        #   - Without this, the robot starts stationary and the PD
-        #     controller maintains HOME_KEYFRAME with no policy corrections
-        #     needed. The policy learns \"output zero = stand still\" and
-        #     never discovers ankle corrections.
-        #   - With \u00b10.2 m/s initial velocity, the robot immediately needs
-        #     a corrective action every episode. Ankle dorsiflexion/
-        #     plantarflexion is the CORRECT mechanical response; the hip-
-        #     leaning strategy that worked for static balance is less
-        #     effective here because it doesn't change the ground contact
-        #     point (CoP) that the ankle controls.
-        #   - \u00b10.2 m/s is moderate: a healthy ankle correction can handle
-        #     it (ankle torque ~35 N\u00b7m at full deflection vs ~17 N\u00b7m needed
-        #     for 0.2 m/s correction). Large enough to require response,
-        #     small enough not to immediately cause fell_over.
-        "velocity_range": {
-          "x": (-0.2, 0.2),
-          "y": (-0.2, 0.2),
-        },
+        "velocity_range": {},
       },
     ),
     "reset_robot_joints": EventTermCfg(
@@ -297,23 +282,14 @@ def make_standup_env_cfg() -> ManagerBasedRlEnvCfg:
     "push_robot": EventTermCfg(
       func=mdp.push_by_setting_velocity,
       mode="interval",
-      # Reduced from (8.0, 15.0) s. Current episodes last 4-7 s (mean ~85
-      # control steps). At 8-15 s interval, pushes NEVER fired during
-      # training -- the robot always fell before the push could happen.
-      # Without pushes the policy only learns static balance (output zero)
-      # and never learns push-recovery leg strategies.
-      # At 3-6 s, pushes reliably fire at least once per episode for the
-      # longer episodes, gradually introducing push-recovery challenge as
-      # episodes get longer.
-      interval_range_s=(3.0, 6.0),
+      # Disabled by default: the base task is "stay standing", not "stay
+      # standing while being pushed". Push recovery is a strictly harder
+      # follow-on skill and should be added back as a curriculum once the
+      # robot can reliably stand for a full episode. Enable per-robot by
+      # overriding interval_range_s and velocity_range in the robot cfg.
+      interval_range_s=(1e9, 1e9),
       params={
-        # Fixed moderate push from iteration 0. The robot starts standing,
-        # so push-recovery is a first-class skill from the start.
-        "velocity_range": {
-          "x": (-0.3, 0.3),
-          "y": (-0.3, 0.3),
-          "z": (-0.2, 0.2),
-        },
+        "velocity_range": {},
       },
     ),
     "foot_friction": EventTermCfg(

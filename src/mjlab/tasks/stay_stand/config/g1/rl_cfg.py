@@ -31,9 +31,11 @@ def unitree_g1_stay_stand_ppo_runner_cfg() -> RslRlOnPolicyRunnerCfg:
       value_loss_coef=1.0,
       use_clipped_value_loss=True,
       clip_param=0.2,
-      # Low entropy_coef: we don't want PPO to inflate std when the policy
-      # gradient is weak; that just makes the robot fall faster.
-      entropy_coef=0.001,
+      # entropy_coef=0.001 still inflated Policy/mean_std (0.30 -> 0.325+)
+      # against a weak balance gradient and triggered the post-step-1000
+      # reward collapse. Zero removes the bias toward growing std; the
+      # init_std=0.3 Gaussian still provides plenty of exploration.
+      entropy_coef=0.0,
       num_learning_epochs=5,
       num_mini_batches=4,
       learning_rate=1.0e-3,
@@ -45,6 +47,11 @@ def unitree_g1_stay_stand_ppo_runner_cfg() -> RslRlOnPolicyRunnerCfg:
     ),
     experiment_name="g1_stay_stand",
     save_interval=50,
-    num_steps_per_env=24,
+    # 24 steps * 0.02 s = 0.48 s of rollout, but episodes run 60-84 steps
+    # (1.2-1.7 s) before termination. The critic was learning value targets
+    # on sub-second fragments while balance outcomes played out over a
+    # full second-plus. 128 steps = 2.56 s covers a full episode, so the
+    # advantage estimator can attribute survival to actions.
+    num_steps_per_env=128,
     max_iterations=3_000,
   )

@@ -4,7 +4,12 @@ This module provides a factory function to create a base stay-stand task config.
 Robot-specific configurations call the factory and customize as needed.
 """
 
+from __future__ import annotations
+
 import math
+from typing import TYPE_CHECKING
+
+import torch
 
 from mjlab.envs import ManagerBasedRlEnvCfg
 from mjlab.envs import mdp
@@ -20,6 +25,30 @@ from mjlab.sim import MujocoCfg, SimulationCfg
 from mjlab.terrains import TerrainEntityCfg
 from mjlab.utils.noise import UniformNoiseCfg as Unoise
 from mjlab.viewer import ViewerConfig
+
+if TYPE_CHECKING:
+  from mjlab.entity import Entity
+  from mjlab.envs.manager_based_rl_env import ManagerBasedRlEnv
+
+
+def fell_over(
+  env: ManagerBasedRlEnv,
+  limit_angle: float,
+  asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+  """Terminate when torso tilt from upright exceeds `limit_angle` (radians).
+
+  Uses ``-projected_gravity_b[:, 2]`` as the "uprightness" scalar: 1.0 when
+  perfectly vertical, ``cos(limit_angle)`` at the threshold tilt, 0.0 when
+  horizontal. The shared ``mjlab.envs.mdp`` package does not ship an
+  orientation-based termination (only ``catastrophic_state`` for sim
+  explosions), so this stay-stand-specific termination lives inline rather
+  than as a separate ``mdp/`` subpackage (kept flat per the task's
+  agent_context.txt).
+  """
+  asset: Entity = env.scene[asset_cfg.name]
+  uprightness = -asset.data.projected_gravity_b[:, 2]
+  return uprightness < math.cos(limit_angle)
 
 
 def make_stay_stand_env_cfg() -> ManagerBasedRlEnvCfg:
@@ -137,7 +166,7 @@ def make_stay_stand_env_cfg() -> ManagerBasedRlEnvCfg:
     "time_out": TerminationTermCfg(func=mdp.time_out, time_out=True),
     # Generous angle: 60deg terminates too aggressively during early exploration.
     "fell_over": TerminationTermCfg(
-      func=mdp.bad_orientation,
+      func=fell_over,
       params={"limit_angle": math.radians(80.0)},
     ),
   }
