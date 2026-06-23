@@ -20,6 +20,22 @@ def unitree_g1_stay_stand_ppo_runner_cfg() -> RslRlOnPolicyRunnerCfg:
         # produces joint perturbations that immediately topple G1. Start tight.
         "init_std": 0.3,
         "std_type": "scalar",
+        # FREEZE THE POLICY STD.
+        # Without this, Policy/mean_std drifts upward across training even at
+        # entropy_coef=0 because PPO's surrogate gradient on log_std slowly
+        # inflates it whenever any outlier action lands on positive advantage.
+        # The agent_context (section 5, symptom 3 + section 6, item 3) documents
+        # this exact failure: training plateaus for ~2200 iters at the bad local
+        # optimum, the growing std finally provides enough random exploration to
+        # stumble on a balance strategy (reward climbs 14 -> 55, ep length 100
+        # -> 550), then the std keeps growing past the noise threshold of the
+        # converged policy and the balance collapses (reward 55 -> 38). With
+        # learn_std=False the std is fixed at init_std and the converged
+        # policy stays converged. Trade-off: the random-exploration-driven
+        # breakthrough takes more iterations to discover purely via mean
+        # updates -- if it stalls, lower init_std to 0.15 (agent_context
+        # section 6, item 2) or extend max_iterations.
+        "learn_std": False,
       },
     ),
     critic=RslRlModelCfg(
@@ -53,5 +69,10 @@ def unitree_g1_stay_stand_ppo_runner_cfg() -> RslRlOnPolicyRunnerCfg:
     # full second-plus. 128 steps = 2.56 s covers a full episode, so the
     # advantage estimator can attribute survival to actions.
     num_steps_per_env=128,
-    max_iterations=3_000,
+    # Bumped 3000 -> 6000. With learn_std=False the breakthrough relies on
+    # gradient-driven mean updates instead of random-exploration luck and
+    # therefore takes longer to discover. The previous 3000-iter run
+    # broke through at iter ~2200 (then collapsed); refinement past the
+    # break-through point needs the additional budget.
+    max_iterations=6_000,
   )
